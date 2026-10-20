@@ -36,6 +36,14 @@ export class PromotionRefusedError extends Error {
   }
 }
 
+export class PromotionIntegrityError extends Error {
+  constructor(message, problems = []) {
+    super(message);
+    this.name = 'PromotionIntegrityError';
+    this.problems = problems;
+  }
+}
+
 /** Accept only a full 40-char hex SHA; uppercase is normalized to lowercase. */
 export function normalizeSha(value) {
   if (typeof value !== 'string' || value.trim() === '') {
@@ -117,8 +125,7 @@ function resolveStoreDir(dir) {
     throw new InvalidEvidenceError('dir must be a non-empty string');
   }
   rejectNullBytes('dir', dir);
-  const resolved = path.resolve(dir);
-  return resolved;
+  return path.resolve(dir);
 }
 
 function ensureInside(root, target) {
@@ -184,6 +191,26 @@ function parseEvidenceObject(raw, expectedId) {
   return { core, id, obj };
 }
 
+function promotionCoreForId(fields) {
+  return {
+    approver: fields.approver,
+    evidenceDigests: fields.evidenceDigests,
+    evidenceIds: fields.evidenceIds,
+    fixSha: fields.fixSha,
+    prevPromotionId: fields.prevPromotionId,
+    promotedAt: fields.promotedAt,
+  };
+}
+
+function promotionIdFromCore(core) {
+  return sha256Hex(canonicalJson(core));
+}
+
+function resolveStrict(store, options = {}) {
+  if (Object.prototype.hasOwnProperty.call(options, 'strict')) return Boolean(options.strict);
+  return store.strict !== false;
+}
+
 /**
  * Create a filesystem-backed immutable QA evidence store.
  * @param {{ dir: string, hmacKey?: string|Buffer, strict?: boolean }} options
@@ -198,7 +225,8 @@ export function createEvidenceStore(options) {
     : Buffer.isBuffer(options.hmacKey)
       ? options.hmacKey
       : Buffer.from(String(options.hmacKey), 'utf8');
-  const strictDefault = options.strict === true;
+  // Fail-closed by default: conflicting failing evidence refuses promotion unless strict:false.
+  const strictDefault = options.strict !== false;
 
   fs.mkdirSync(path.join(root, 'evidence'), { recursive: true });
   fs.mkdirSync(path.join(root, 'promotions'), { recursive: true });
@@ -212,9 +240,17 @@ export function createEvidenceStore(options) {
     return file;
   }
 
-  function promotionPath(fixSha) {
-    const sha = normalizeSha(fixSha);
-    const file = path.join(root, 'promotions', `${sha}.json`);
+  function promotionPath(promotionId) {
+    if (!HASH64_RE.test(promotionId)) {
+      throw new InvalidEvidenceError('promotionId must be a 64-character hex digest');
+    }
+    const file = path.join(root, 'promotions', `${promotionId}.json`);
+    ensureInside(root, file);
+    return file;
+  }
+
+  function headFilePath() {
+    const file = path.join(root, 'promotions', 'HEAD');
     ensureInside(root, file);
     return file;
   }
@@ -261,6 +297,8 @@ export function createEvidenceStore(options) {
       runner: core.runner,
       recordedAt: obj.recordedAt,
       seal: obj.seal,
+      _raw: raw,
+      _contentHash: sha256Hex(raw),
     };
   }
 
@@ -278,6 +316,119 @@ export function createEvidenceStore(options) {
     } catch {
       // Best-effort read-only; some platforms may ignore.
     }
+  }
+
+  function writeReplace(file, text) {
+    ensureInside(root, file);
+    const tmp = `${file}.tmp`;
+    const fd = fs.openSync(tmp, 'w');
+    try {
+      fs.writeFileSync(fd, text);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    try {
+      fs.renameSync(tmp, file);
+    } catch {
+      try { fs.unlinkSync(file); } catch { /* ignore */ }
+      fs.renameSync(tmp, file);
+    }
+  }
+
+  function readHead() {
+    const file = headFilePath();
+    if (!fs.existsSync(file)) return { head: null, seal: undefined };
+    let obj;
+    try {
+      obj = JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch (cause) {
+      throw new PromotionIntegrityError('HEAD file is not valid JSON', ['HEAD is not valid JSON']);
+    }
+    if (!obj || typeof obj !== 'object' || (obj.head != null && !HASH64_RE.test(obj.head))) {
+      throw new PromotionIntegrityError('HEAD file is malformed', ['HEAD is malformed']);
+    }
+    if (hmacKey) {
+      if (typeof obj.seal !== 'string' || !HASH64_RE.test(obj.seal)) {
+        throw new PromotionIntegrityError('HEAD seal missing or invalid', ['HEAD seal missing or invalid']);
+      }
+      const want = sealPayload({ head: obj.head }, hmacKey);
+      if (obj.seal !== want) {
+        throw new PromotionIntegrityError('HEAD seal verification failed', ['HEAD seal verification failed']);
+      }
+    }
+    return { head: obj.head ?? null, seal: obj.seal };
+  }
+
+  function writeHead(headId) {
+    const obj = { head: headId };
+    if (hmacKey) obj.seal = sealPayload({ head: headId }, hmacKey);
+    writeReplace(headFilePath(), `${canonicalJson(obj)}\n`);
+  }
+
+  function parsePromotionRecord(raw, expectedId) {
+    let obj;
+    try {
+      obj = JSON.parse(raw);
+    } catch (cause) {
+      throw new TamperedEvidenceError('promotion file is not valid JSON', { cause });
+    }
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+      throw new TamperedEvidenceError('promotion file must contain a JSON object');
+    }
+    if (!Array.isArray(obj.evidenceIds) || !Array.isArray(obj.evidenceDigests)) {
+      throw new TamperedEvidenceError('promotion record missing evidenceIds/evidenceDigests');
+    }
+    const core = promotionCoreForId({
+      approver: obj.approver,
+      evidenceDigests: obj.evidenceDigests,
+      evidenceIds: obj.evidenceIds,
+      fixSha: normalizeSha(obj.fixSha),
+      prevPromotionId: obj.prevPromotionId == null ? null : obj.prevPromotionId,
+      promotedAt: obj.promotedAt,
+    });
+    if (core.prevPromotionId != null && !HASH64_RE.test(core.prevPromotionId)) {
+      throw new TamperedEvidenceError('prevPromotionId is invalid');
+    }
+    const id = promotionIdFromCore(core);
+    if (expectedId && id !== expectedId) {
+      throw new TamperedEvidenceError('promotion content hash does not match promotionId');
+    }
+    if (obj.promotionId != null && obj.promotionId !== id) {
+      throw new TamperedEvidenceError('embedded promotionId does not match content hash');
+    }
+    if (hmacKey) {
+      if (typeof obj.seal !== 'string' || !HASH64_RE.test(obj.seal)) {
+        throw new TamperedEvidenceError('promotion seal missing or invalid');
+      }
+      const material = { ...core, promotionId: id };
+      const want = sealPayload(material, hmacKey);
+      if (obj.seal !== want) {
+        throw new TamperedEvidenceError('promotion seal verification failed');
+      }
+    }
+    return {
+      promotionId: id,
+      approver: core.approver,
+      evidenceDigests: core.evidenceDigests,
+      evidenceIds: core.evidenceIds,
+      fixSha: core.fixSha,
+      prevPromotionId: core.prevPromotionId,
+      promotedAt: core.promotedAt,
+      seal: obj.seal,
+    };
+  }
+
+  function readPromotionFile(promotionId) {
+    const file = promotionPath(promotionId);
+    let raw;
+    try {
+      raw = fs.readFileSync(file, 'utf8');
+    } catch (err) {
+      if (err?.code === 'ENOENT') return null;
+      throw err;
+    }
+    return parsePromotionRecord(raw, promotionId);
   }
 
   /**
@@ -334,7 +485,11 @@ export function createEvidenceStore(options) {
 
     try {
       writeExclusive(file, text);
-      return { evidenceId, created: true, record: readEvidenceFile(file, evidenceId) };
+      const saved = readEvidenceFile(file, evidenceId);
+      const { _raw, _contentHash, ...publicRec } = saved;
+      void _raw;
+      void _contentHash;
+      return { evidenceId, created: true, record: publicRec };
     } catch (err) {
       if (err?.code !== 'EEXIST') throw err;
       const existingRaw = fs.readFileSync(file, 'utf8');
@@ -343,7 +498,10 @@ export function createEvidenceStore(options) {
         throw new TamperedEvidenceError('evidenceId exists with different content');
       }
       const existing = readEvidenceFile(file, evidenceId);
-      return { evidenceId, created: false, record: existing };
+      const { _raw, _contentHash, ...publicRec } = existing;
+      void _raw;
+      void _contentHash;
+      return { evidenceId, created: false, record: publicRec };
     }
   }
 
@@ -355,7 +513,10 @@ export function createEvidenceStore(options) {
     const file = evidencePath(id);
     const rec = readEvidenceFile(file, id);
     if (!rec) throw new InvalidEvidenceError(`unknown evidenceId ${id}`);
-    return rec;
+    const { _raw, _contentHash, ...publicRec } = rec;
+    void _raw;
+    void _contentHash;
+    return publicRec;
   }
 
   function listEvidence(fixShaFilter) {
@@ -366,23 +527,48 @@ export function createEvidenceStore(options) {
     for (const name of names) {
       const id = name.slice(0, -'.json'.length);
       if (!HASH64_RE.test(id)) continue;
+      // Fail-closed: a single tampered evidence file aborts listing for the whole store.
       const rec = readEvidenceFile(path.join(dir, name), id);
       if (!rec) continue;
       if (want && rec.fixSha !== want) continue;
-      out.push(rec);
+      const { _raw, _contentHash, ...publicRec } = rec;
+      void _raw;
+      void _contentHash;
+      out.push(publicRec);
     }
     return out;
+  }
+
+  function buildEvidenceDigests(evidenceIds) {
+    const digests = [];
+    for (const id of evidenceIds) {
+      const file = evidencePath(id);
+      const raw = fs.readFileSync(file);
+      digests.push({ evidenceId: id, contentHash: sha256Hex(raw) });
+    }
+    digests.sort((a, b) => (a.evidenceId < b.evidenceId ? -1 : a.evidenceId > b.evidenceId ? 1 : 0));
+    return digests;
   }
 
   return {
     dir: root,
     hmacEnabled: Boolean(hmacKey),
+    hmacKey,
     strict: strictDefault,
     recordEvidence,
     getEvidence,
     listEvidence,
     evidencePath,
     promotionPath,
+    headFilePath,
+    readHead,
+    writeHead,
+    readPromotionFile,
+    parsePromotionRecord,
+    buildEvidenceDigests,
+    writeExclusive,
+    writeReplace,
+    readEvidenceFile,
   };
 }
 
@@ -408,14 +594,125 @@ function isPassingEvidence(rec, fixSha) {
 }
 
 /**
- * Decide whether fixSha may be promoted using only stored evidence.
+ * Walk the promotion hash chain and validate links, seals, and referenced evidence.
  * @param {ReturnType<typeof createEvidenceStore>} store
- * @param {string} fixSha
- * @param {{ strict?: boolean }} [options]
+ * @param {{ expectedHead?: string|null }} [options]
+ */
+export function verifyPromotions(store, options = {}) {
+  const problems = [];
+  let headMeta;
+  try {
+    headMeta = store.readHead();
+  } catch (err) {
+    if (err instanceof PromotionIntegrityError) {
+      return { ok: false, problems: err.problems, head: null };
+    }
+    throw err;
+  }
+
+  const head = headMeta.head;
+  if (Object.prototype.hasOwnProperty.call(options, 'expectedHead')) {
+    const expected = options.expectedHead == null ? null : String(options.expectedHead).toLowerCase();
+    if (expected !== head) {
+      problems.push(`HEAD does not match expectedHead (have ${head}, expected ${expected})`);
+    }
+  }
+
+  if (head == null) {
+    return { ok: problems.length === 0, problems, head: null };
+  }
+
+  let currentId = head;
+  const seen = new Set();
+  let last = null;
+  while (currentId != null) {
+    if (seen.has(currentId)) {
+      problems.push(`cycle detected at ${currentId}`);
+      break;
+    }
+    seen.add(currentId);
+    let rec;
+    try {
+      rec = store.readPromotionFile(currentId);
+    } catch (err) {
+      problems.push(`promotion ${currentId}: ${err.message}`);
+      break;
+    }
+    if (!rec) {
+      problems.push(`missing promotion file for chain id ${currentId} (HEAD/chain mismatch)`);
+      break;
+    }
+    last = rec;
+    for (const digest of rec.evidenceDigests) {
+      if (!digest || !HASH64_RE.test(digest.evidenceId) || !HASH64_RE.test(digest.contentHash)) {
+        problems.push(`promotion ${currentId}: malformed evidence digest`);
+        continue;
+      }
+      const file = store.evidencePath(digest.evidenceId);
+      let raw;
+      try {
+        raw = fs.readFileSync(file);
+      } catch {
+        problems.push(`promotion ${currentId}: missing evidence ${digest.evidenceId}`);
+        continue;
+      }
+      try {
+        store.readEvidenceFile(file, digest.evidenceId);
+      } catch (err) {
+        problems.push(`promotion ${currentId}: evidence ${digest.evidenceId} invalid (${err.message})`);
+        continue;
+      }
+      const hash = sha256Hex(raw);
+      if (hash !== digest.contentHash) {
+        problems.push(`promotion ${currentId}: evidence ${digest.evidenceId} content hash mismatch`);
+      }
+    }
+    const sortedIds = [...rec.evidenceIds].sort();
+    const digestIds = rec.evidenceDigests.map((d) => d.evidenceId).sort();
+    if (canonicalJson(sortedIds) !== canonicalJson(digestIds)) {
+      problems.push(`promotion ${currentId}: evidenceIds do not match evidenceDigests`);
+    }
+    currentId = rec.prevPromotionId;
+  }
+
+  if (head && last && last.promotionId !== head && problems.length === 0) {
+    // head is the tip; last after walk is the genesis. Ensure tip file matched head (already).
+  }
+
+  return { ok: problems.length === 0, problems, head };
+}
+
+function assertPromotionIntegrity(store, options) {
+  const v = verifyPromotions(store, options);
+  if (!v.ok) {
+    throw new PromotionIntegrityError(
+      `promotion chain integrity check failed: ${v.problems.join('; ')}`,
+      v.problems,
+    );
+  }
+  return v;
+}
+
+function findPromotionForFixSha(store, fixSha) {
+  const head = store.readHead().head;
+  let currentId = head;
+  while (currentId != null) {
+    const rec = store.readPromotionFile(currentId);
+    if (!rec) throw new PromotionIntegrityError(`missing promotion ${currentId}`, [`missing promotion ${currentId}`]);
+    if (rec.fixSha === fixSha) return rec;
+    currentId = rec.prevPromotionId;
+  }
+  return null;
+}
+
+/**
+ * Decide whether fixSha may be promoted using only stored evidence.
+ * Refuses with PromotionIntegrityError when the promotion chain is broken.
  */
 export function evaluatePromotion(store, fixSha, options = {}) {
+  assertPromotionIntegrity(store);
   const sha = normalizeSha(fixSha);
-  const strict = options.strict === true || store.strict === true;
+  const strict = resolveStrict(store, options);
   const all = store.listEvidence(sha);
   const reasons = [];
   const evidenceIds = [];
@@ -448,14 +745,15 @@ export function evaluatePromotion(store, fixSha, options = {}) {
     if (strict) {
       return { promotable: false, reasons, evidenceIds };
     }
+    reasons.push('strict:false mitigation in effect; a single accidental pass may allow promotion');
   }
 
-  return { promotable: true, reasons, evidenceIds: passingIds };
+  return { promotable: true, reasons, evidenceIds: [...passingIds].sort() };
 }
 
 /**
- * Write an immutable promotion record when evaluatePromotion allows it.
- * Re-promoting the same fixSha is idempotent.
+ * Append an immutable promotion record to the hash chain when evaluation allows it.
+ * Re-promoting the same fixSha re-checks stored evidenceIds against a fresh evaluation.
  */
 export function promote(store, fixSha, { approver } = {}) {
   if (typeof approver !== 'string' || approver.trim() === '') {
@@ -463,6 +761,8 @@ export function promote(store, fixSha, { approver } = {}) {
   }
   rejectNullBytes('approver', approver);
   if (approver.length > 256) throw new InvalidEvidenceError('approver exceeds 256 characters');
+
+  assertPromotionIntegrity(store);
 
   const sha = normalizeSha(fixSha);
   const decision = evaluatePromotion(store, sha);
@@ -473,35 +773,45 @@ export function promote(store, fixSha, { approver } = {}) {
     );
   }
 
-  const file = store.promotionPath(sha);
-  const record = {
-    approver: approver.trim(),
-    evidenceIds: [...decision.evidenceIds].sort(),
-    fixSha: sha,
-    promotedAt: new Date().toISOString(),
-  };
-  const text = `${canonicalJson(record)}\n`;
-
-  try {
-    const fd = fs.openSync(file, 'wx');
-    try {
-      fs.writeFileSync(fd, text);
-      fs.fsyncSync(fd);
-    } finally {
-      fs.closeSync(fd);
+  const existing = findPromotionForFixSha(store, sha);
+  if (existing) {
+    // Re-read from disk to detect edits; content hash / seal must still match.
+    const fresh = store.readPromotionFile(existing.promotionId);
+    if (!fresh) {
+      throw new PromotionIntegrityError(`missing promotion ${existing.promotionId}`, [`missing promotion ${existing.promotionId}`]);
     }
-    try {
-      fs.chmodSync(file, 0o444);
-    } catch {
-      // best-effort
+    const wantIds = [...decision.evidenceIds].sort();
+    const haveIds = [...fresh.evidenceIds].sort();
+    if (canonicalJson(wantIds) !== canonicalJson(haveIds)) {
+      throw new TamperedEvidenceError('stored promotion evidenceIds do not match current evaluation');
     }
-    return { created: true, record };
-  } catch (err) {
-    if (err?.code !== 'EEXIST') throw err;
-    const existing = JSON.parse(fs.readFileSync(file, 'utf8'));
-    if (existing.fixSha !== sha) {
-      throw new TamperedEvidenceError('promotion file fixSha mismatch');
+    // Detect approver / digest edits even when ids coincide.
+    const digests = store.buildEvidenceDigests(haveIds);
+    if (canonicalJson(digests) !== canonicalJson(fresh.evidenceDigests)) {
+      throw new TamperedEvidenceError('stored promotion evidenceDigests do not match evidence files');
     }
-    return { created: false, record: existing };
+    return { created: false, record: fresh };
   }
+
+  const prevPromotionId = store.readHead().head;
+  const evidenceIds = [...decision.evidenceIds].sort();
+  const evidenceDigests = store.buildEvidenceDigests(evidenceIds);
+  const promotedAt = new Date().toISOString();
+  const core = promotionCoreForId({
+    approver: approver.trim(),
+    evidenceDigests,
+    evidenceIds,
+    fixSha: sha,
+    prevPromotionId,
+    promotedAt,
+  });
+  const promotionId = promotionIdFromCore(core);
+  const record = { ...core, promotionId };
+  if (store.hmacEnabled) {
+    record.seal = sealPayload({ ...core, promotionId }, store.hmacKey);
+  }
+  const text = `${canonicalJson(record)}\n`;
+  store.writeExclusive(store.promotionPath(promotionId), text);
+  store.writeHead(promotionId);
+  return { created: true, record: store.readPromotionFile(promotionId) };
 }

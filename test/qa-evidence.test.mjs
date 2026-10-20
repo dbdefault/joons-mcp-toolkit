@@ -73,15 +73,16 @@ test('PASS evidence for another commit is never reused for this fixSha', () => {
   assert.ok(decision.reasons.some((r) => /no evidence/.test(r)));
 });
 
-test('failing evidence alone is not promotable; passing sibling still promotes with conflict reason', () => {
+test('failing evidence alone is not promotable; default strict keeps mixed results refused', () => {
   const store = tmpStore();
   store.recordEvidence(passFields({ command: 'node --test fail', exitCode: 1, passed: 0, failed: 2, outputHash: sha256Hex('fail') }));
   let decision = evaluatePromotion(store, FIX);
   assert.equal(decision.promotable, false);
 
   store.recordEvidence(passFields({ command: 'node --test pass', outputHash: sha256Hex('pass') }));
+  // Default is fail-closed (strict:true). Explicit relaxation is covered in fix1 tests.
   decision = evaluatePromotion(store, FIX);
-  assert.equal(decision.promotable, true);
+  assert.equal(decision.promotable, false);
   assert.ok(decision.reasons.some((r) => /conflicting failing evidence/.test(r)));
 });
 
@@ -91,7 +92,7 @@ test('exitCode !== 0 is not promotable', () => {
   assert.equal(evaluatePromotion(store, FIX).promotable, false);
 });
 
-test('strict mode refuses when any failing evidence exists', () => {
+test('store constructed with strict:true still refuses mixed pass/fail evidence', () => {
   const store = tmpStore({ strict: true });
   store.recordEvidence(passFields({ command: 'fail', exitCode: 1, passed: 0, failed: 1, outputHash: sha256Hex('f') }));
   store.recordEvidence(passFields({ command: 'pass', outputHash: sha256Hex('p') }));
@@ -146,20 +147,23 @@ test('HMAC: unsigned or wrong-key records are rejected; correct key passes', () 
   assert.throws(() => wrong.getEvidence(saved.evidenceId), TamperedEvidenceError);
 });
 
-test('promotion writes immutable file, is idempotent, and refuses without files', () => {
+test('promotion writes immutable chain record, is idempotent, and refuses without files', () => {
   const store = tmpStore();
   store.recordEvidence(passFields());
   const first = promote(store, FIX, { approver: 'reviewer-1' });
   assert.equal(first.created, true);
+  assert.ok(first.record.promotionId);
+  assert.equal(first.record.prevPromotionId, null);
   const second = promote(store, FIX, { approver: 'reviewer-2' });
   assert.equal(second.created, false);
   assert.equal(second.record.approver, 'reviewer-1');
-  const names = fs.readdirSync(path.join(store.dir, 'promotions'));
+  const names = fs.readdirSync(path.join(store.dir, 'promotions')).filter((n) => n.endsWith('.json'));
   assert.equal(names.length, 1);
+  assert.ok(fs.existsSync(path.join(store.dir, 'promotions', 'HEAD')));
 
   const empty = tmpStore();
   assert.throws(() => promote(empty, FIX, { approver: 'x' }), PromotionRefusedError);
-  assert.equal(fs.readdirSync(path.join(empty.dir, 'promotions')).length, 0);
+  assert.equal(fs.readdirSync(path.join(empty.dir, 'promotions')).filter((n) => n.endsWith('.json')).length, 0);
 });
 
 test('path escape attempts are rejected', () => {

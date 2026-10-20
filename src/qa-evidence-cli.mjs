@@ -8,12 +8,17 @@ import {
   InvalidEvidenceError,
   TamperedEvidenceError,
   PromotionRefusedError,
+  PromotionIntegrityError,
 } from './qa-evidence.mjs';
 
 function usage() {
   return `Usage:
-  node src/qa-evidence-cli.mjs record --dir DIR --fix SHA --tested SHA --cmd TEXT --exit N --passed N --failed N --output-file FILE [--runner NAME] [--hmac-key KEY]
-  node src/qa-evidence-cli.mjs check --dir DIR --fix SHA [--strict] [--hmac-key KEY]
+  node src/qa-evidence-cli.mjs record --dir DIR --fix SHA --tested SHA --cmd TEXT --exit N --passed N --failed N --output-file FILE [--runner NAME] [--hmac-key-env NAME | --hmac-key-file PATH]
+  node src/qa-evidence-cli.mjs check --dir DIR --fix SHA [--strict|--no-strict] [--hmac-key-env NAME | --hmac-key-file PATH]
+
+HMAC secrets must not be passed on the command line.
+Use --hmac-key-env NAME (read process.env[NAME]) or --hmac-key-file PATH.
+The flag --hmac-key <value> is not accepted.
 `;
 }
 
@@ -50,6 +55,46 @@ function toInt(label, value) {
   return n;
 }
 
+function resolveHmacKey(args) {
+  if (Object.prototype.hasOwnProperty.call(args, 'hmac-key')) {
+    // Do not echo any provided value.
+    throw new Error(
+      '--hmac-key is not accepted; pass --hmac-key-env NAME or --hmac-key-file PATH instead',
+    );
+  }
+  const envName = args['hmac-key-env'];
+  const filePath = args['hmac-key-file'];
+  if (envName && filePath && envName !== true && filePath !== true) {
+    throw new Error('use only one of --hmac-key-env or --hmac-key-file');
+  }
+  if (envName && envName !== true) {
+    const value = process.env[envName];
+    if (value == null || value === '') {
+      throw new Error(`environment variable ${envName} is empty or unset`);
+    }
+    return value;
+  }
+  if (filePath && filePath !== true) {
+    warnLooseKeyPermissions(filePath);
+    return fs.readFileSync(filePath, 'utf8').replace(/\r?\n$/, '');
+  }
+  return undefined;
+}
+
+function warnLooseKeyPermissions(filePath) {
+  if (process.platform === 'win32') return;
+  try {
+    const mode = fs.statSync(filePath).mode & 0o777;
+    if (mode & 0o077) {
+      process.stderr.write(
+        `warning: hmac key file permissions are loose (mode ${mode.toString(8)}); prefer 0600\n`,
+      );
+    }
+  } catch {
+    // Permission probe is best-effort.
+  }
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const cmd = args._[0];
@@ -59,8 +104,15 @@ async function main() {
   }
 
   const dir = requireFlag(args, 'dir');
-  const hmacKey = args['hmac-key'] == null || args['hmac-key'] === true ? undefined : args['hmac-key'];
-  const store = createEvidenceStore({ dir, hmacKey, strict: args.strict === true });
+  const hmacKey = resolveHmacKey(args);
+  let strict;
+  if (args['no-strict'] === true) strict = false;
+  else if (args.strict === true) strict = true;
+  const store = createEvidenceStore({
+    dir,
+    hmacKey,
+    ...(strict === undefined ? {} : { strict }),
+  });
 
   if (cmd === 'record') {
     const outputFile = requireFlag(args, 'output-file');
@@ -82,7 +134,11 @@ async function main() {
 
   if (cmd === 'check') {
     const fixSha = requireFlag(args, 'fix');
-    const decision = evaluatePromotion(store, fixSha, { strict: args.strict === true });
+    const decision = evaluatePromotion(
+      store,
+      fixSha,
+      strict === undefined ? {} : { strict },
+    );
     process.stdout.write(`${JSON.stringify(decision, null, 2)}\n`);
     process.exit(decision.promotable ? 0 : 1);
   }
@@ -92,8 +148,15 @@ async function main() {
 }
 
 main().catch((err) => {
-  const known = [InvalidShaError, InvalidEvidenceError, TamperedEvidenceError, PromotionRefusedError, Error];
-  process.stderr.write(`${err?.name || 'Error'}: ${err.message}\n`);
-  void known;
+  const name = err?.name || 'Error';
+  // Never include secret material; messages are constructed without key values.
+  process.stderr.write(`${name}: ${err.message}\n`);
+  if (err instanceof PromotionIntegrityError && Array.isArray(err.problems)) {
+    for (const p of err.problems) process.stderr.write(`- ${p}\n`);
+  }
+  void InvalidShaError;
+  void InvalidEvidenceError;
+  void TamperedEvidenceError;
+  void PromotionRefusedError;
   process.exit(1);
 });
