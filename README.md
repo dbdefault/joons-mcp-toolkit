@@ -53,6 +53,8 @@ The built-in Node.js test runner covers concurrent same-ID calls, payload confli
 ### Design notes
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) covers routing, state transitions, trust boundaries, and deployment cautions.
 
+QA evidence (immutable SHA-bound test records and promotion checks): [docs/QA-EVIDENCE.md](docs/QA-EVIDENCE.md).
+
 ## Quick start
 
 Requires Node.js 20 or later. No API key or cloud service is needed.
