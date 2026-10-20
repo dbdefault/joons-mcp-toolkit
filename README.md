@@ -2,7 +2,7 @@
 
 **Reference patterns for reliable AI agents, Model Context Protocol (MCP) tools, and multi-host orchestration.**
 
-> Status: early open-source reference project. The public examples are standalone and do **not** expose or require any private proprietary installation. They are not a production-ready remote execution gateway.
+> Status: early open-source reference project. The public examples are standalone and do **not** expose or require the private JOONS CORE installation. They are not a production-ready remote execution gateway.
 
 ## Why this project exists
 
@@ -130,7 +130,7 @@ MIT — see [LICENSE](LICENSE).
 
 ## Provenance and transparency
 
-This public repository was created as a clean, standalone project. Private proprietary systems and repositories are **not** mirrored here. The author maintains private AI orchestration tooling; claims of widespread public adoption, package downloads, external contributors, or third-party production use are **not** made.
+This public repository was created as a clean, standalone project. The private JOONS CORE system and its repositories are **not** mirrored here. The author maintains private AI orchestration tooling; claims of widespread public adoption, package downloads, external contributors, or third-party production use are **not** made.
 
 ### About the maintainer
 
