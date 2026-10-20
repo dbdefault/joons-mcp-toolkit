@@ -552,4 +552,48 @@ describe('adapter examples', { concurrency: false }, () => {
       await host.close();
     }
   });
+
+  test('stdio mux (i) completedIds stays within bound after many requests; duplicates still first-wins', async () => {
+    const { COMPLETED_IDS_LIMIT } = await import('../examples/stdio-agent-adapter/adapter.mjs');
+    assert.ok(COMPLETED_IDS_LIMIT >= 1);
+    const proto = [];
+    const host = await createStdioAgentHost({
+      command: process.execPath,
+      args: [mockAgentPath, 'ok'],
+      timeoutMs: 5000,
+      maxLineBytes: 64_000,
+      onProtocolError: (info) => proto.push(info),
+    });
+    try {
+      for (let i = 1; i <= 2000; i++) {
+        const out = await host.send({ jsonrpc: '2.0', id: i, method: 'demo.echo', params: { n: i } });
+        assert.equal(out.id, i);
+      }
+      assert.ok(host.completedIdsSize <= COMPLETED_IDS_LIMIT, `size=${host.completedIdsSize}`);
+      assert.equal(host.completedIdsSize, COMPLETED_IDS_LIMIT);
+
+      // Within the retained window, a duplicate of the newest id is still protocol-error only.
+      const dupHost = await createStdioAgentHost({
+        command: process.execPath,
+        args: [mockAgentPath, 'duplicate-id'],
+        timeoutMs: 2000,
+        maxLineBytes: 64_000,
+        onProtocolError: (info) => proto.push(info),
+      });
+      try {
+        const before = proto.length;
+        const out = await dupHost.send({ jsonrpc: '2.0', id: 9001, method: 'demo.echo', params: {} });
+        assert.equal(out.result.which, 'first');
+        for (let i = 0; i < 20 && proto.length <= before; i++) {
+          await new Promise((r) => setTimeout(r, 10));
+        }
+        assert.ok(proto.length > before);
+        assert.equal(proto[proto.length - 1].kind, 'duplicate_response');
+      } finally {
+        await dupHost.close();
+      }
+    } finally {
+      await host.close();
+    }
+  });
 });

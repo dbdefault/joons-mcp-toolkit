@@ -20,7 +20,7 @@ Same router contract as the HTTP example:
 | `after_send` | Request was written, then the child exited early or returned an invalid JSON-RPC line |
 | `unknown` or omitted | Timeout or abort while waiting |
 
-Matched by JSON-RPC `id`. Notifications (`method`, no `id`) and server→client requests (`method` + `id`) are not treated as responses: optional `onNotification` / `onServerRequest` callbacks may observe them (errors in callbacks are swallowed). Unmatched or duplicate response ids and malformed lines are reported via `onProtocolError` without failing other in-flight calls. Oversized lines still fail in-flight work. stderr is kept only as a short diagnostic tail and is not copied into success payloads.
+Matched by JSON-RPC `id`. Notifications (`method`, no `id`) and server→client requests (`method` + `id`) are not treated as responses: optional `onNotification` / `onServerRequest` callbacks may observe them (errors in callbacks are swallowed). Unmatched or duplicate response ids and malformed lines are reported via `onProtocolError` without failing other in-flight calls. Remembered completed response ids are capped (default 1024, oldest dropped) so a long-lived host does not grow without bound; a late response for an evicted id is reported as an unmatched protocol error like any other unknown id. Oversized lines still fail in-flight work. stderr is kept only as a short diagnostic tail and is not copied into success payloads.
 
 ## Run
 

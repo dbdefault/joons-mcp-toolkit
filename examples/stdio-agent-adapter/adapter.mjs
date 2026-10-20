@@ -14,6 +14,31 @@ import { createInterface } from 'node:readline';
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_MAX_LINE_BYTES = 1_048_576;
+/** Cap remembered completed response ids (insertion-order eviction of oldest). */
+export const COMPLETED_IDS_LIMIT = 1024;
+
+/** Bounded Set of response ids; Map keeps insertion order for eviction. */
+export class BoundedIdSet {
+  #map = new Map();
+  #limit;
+  constructor(limit = COMPLETED_IDS_LIMIT) {
+    this.#limit = Math.max(1, Number(limit) || COMPLETED_IDS_LIMIT);
+  }
+  has(id) {
+    return this.#map.has(id);
+  }
+  add(id) {
+    if (this.#map.has(id)) return;
+    this.#map.set(id, true);
+    while (this.#map.size > this.#limit) {
+      const oldest = this.#map.keys().next().value;
+      this.#map.delete(oldest);
+    }
+  }
+  get size() {
+    return this.#map.size;
+  }
+}
 
 function phasedError(message, phase) {
   const err = new Error(message);
@@ -135,7 +160,7 @@ export async function createStdioAgentHost(opts = {}) {
   let closed = false;
   let exitInfo = null;
   const pending = new Map();
-  const completedIds = new Set();
+  const completedIds = new BoundedIdSet(opts.completedIdsLimit ?? COMPLETED_IDS_LIMIT);
   let stderrTail = '';
 
   child.stderr.setEncoding('utf8');
@@ -256,6 +281,9 @@ export async function createStdioAgentHost(opts = {}) {
 
   return {
     pid: child.pid,
+    get completedIdsSize() {
+      return completedIds.size;
+    },
     async send(request, { signal } = {}) {
       if (closed || exitInfo) {
         throw phasedError('stdio agent is not running', 'before_send');
