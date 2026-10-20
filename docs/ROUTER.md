@@ -82,17 +82,18 @@ Once a send may have started, another host must not execute the same `requestId`
 
 ## Deduplication and memory
 
-- Same `requestId` + same request fingerprint: one in-flight promise; later callers share it.
-- Same `requestId` + different request: `FAILED` with a conflict message.
+- Same `requestId` + same fingerprint (request payload + normalized target): one in-flight promise; later callers share it.
+- Same `requestId` + different request or different target: `FAILED` with a conflict message (no send).
 - Default store is an in-memory `Map` with a size cap (default 10_000). Oldest **completed** entries are dropped first; in-flight entries are kept.
 - Optional `{ get, set }` store injection is supported for experiments. Durable persistence is out of scope (separate ledger work).
 
 ## Safety
 
-- Error messages copied into results are stripped of control characters and capped (200 chars).
-- The router does not echo the request body, tokens, or secrets into `result` / `attempts`.
+- Error messages copied into results are stripped of control characters and capped (200 chars). The router does **not** redact or mask secret-looking substrings inside those messages; adapters must not put request bodies, tokens, or other secrets into thrown error messages.
+- The router does not copy the request object into `result` / `attempts`.
 - Synchronous throws from `send` are caught.
 - Optional `AbortSignal`: abort detected **before** calling `send` is treated like `before_send` (fallback allowed when target is unset). Ambiguity after send remains `UNKNOWN`.
+- Deduplication fingerprints include both the request payload and the normalized `target` (omitted vs explicit are distinct). A same `requestId` with a different target is a conflict and does not send.
 
 ## Legacy compatibility facade (`createHostRouter`)
 
@@ -115,6 +116,7 @@ Each legacy `call` uses a fresh `requestId`, so the core’s request-id ledger d
 ## Limits
 
 - No durable ledger across process restarts.
+- In-memory dedupe is bounded: after the completed-record cap is exceeded, older finished entries may be dropped, so the same `requestId` can run again. Cross-restart and unbounded duplicate suppression belong to a durable ledger.
 - No built-in network client, discovery, auth, or MCP session management.
 - Host adapters are responsible for real transport semantics and honest `phase` labeling.
 - Custom stores must implement their own retention if they ignore the default eviction path.
