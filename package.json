@@ -9,5 +9,18 @@
   },
   "scripts": {
     "test": "node --test"
+  },
+  "files": [
+    "src",
+    "docs",
+    "examples",
+    "README.md",
+    "LICENSE",
+    "SECURITY.md",
+    "CONTRIBUTING.md"
+  ],
+  "exports": {
+    "./ledger": "./src/ledger.mjs",
+    "./request-coordinator": "./src/request-coordinator.mjs"
   }
 }
