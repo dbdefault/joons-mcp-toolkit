@@ -2,6 +2,12 @@
  * stdio JSON-RPC 2.0 host adapter (educational).
  * Spawns a child process and exchanges newline-delimited JSON-RPC on stdin/stdout.
  * Contract: host.send(request, { signal }) and Error.phase for multi-host routers.
+ *
+ * Incoming lines are classified per JSON-RPC 2.0:
+ *   response       — id present, method absent, result XOR error
+ *   notification   — method present, id absent
+ *   server_request — method and id both present
+ *   malformed      — anything else / bad JSON / wrong jsonrpc
  */
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
@@ -15,12 +21,42 @@ function phasedError(message, phase) {
   return err;
 }
 
+function callSafe(fn, arg) {
+  if (typeof fn !== 'function') return;
+  try {
+    fn(arg);
+  } catch {
+    // Callback failures must not break the adapter.
+  }
+}
+
+/**
+ * @param {unknown} msg
+ * @returns {'response'|'notification'|'server_request'|'malformed'}
+ */
+export function classifyJsonRpcMessage(msg) {
+  if (!msg || typeof msg !== 'object' || Array.isArray(msg)) return 'malformed';
+  if (msg.jsonrpc !== '2.0') return 'malformed';
+  const hasMethod = Object.prototype.hasOwnProperty.call(msg, 'method');
+  const hasId = Object.prototype.hasOwnProperty.call(msg, 'id');
+  const hasResult = Object.prototype.hasOwnProperty.call(msg, 'result');
+  const hasError = Object.prototype.hasOwnProperty.call(msg, 'error');
+
+  if (hasMethod && !hasId) return 'notification';
+  if (hasMethod && hasId) return 'server_request';
+  if (!hasMethod && hasId && (hasResult || hasError)) return 'response';
+  return 'malformed';
+}
+
 function validateJsonRpcResponse(body, requestId) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     throw phasedError('stdio response is not a JSON object', 'after_send');
   }
   if (body.jsonrpc !== '2.0') {
     throw phasedError('stdio response jsonrpc must be "2.0"', 'after_send');
+  }
+  if (Object.prototype.hasOwnProperty.call(body, 'method')) {
+    throw phasedError('stdio response must not include method', 'after_send');
   }
   if (!Object.is(body.id, requestId)) {
     throw phasedError('stdio response id does not match the request', 'after_send');
@@ -37,7 +73,17 @@ function validateJsonRpcResponse(body, requestId) {
 }
 
 /**
- * @param {{ command: string, args?: string[], env?: NodeJS.ProcessEnv, timeoutMs?: number, maxLineBytes?: number }} opts
+ * @param {{
+ *   command: string,
+ *   args?: string[],
+ *   env?: NodeJS.ProcessEnv,
+ *   timeoutMs?: number,
+ *   maxLineBytes?: number,
+ *   onNotification?: (msg: object) => void,
+ *   onServerRequest?: (msg: object) => void,
+ *   onProtocolError?: (info: object) => void,
+ *   replyMethodNotFound?: boolean,
+ * }} opts
  */
 export async function createStdioAgentHost(opts = {}) {
   const command = opts.command;
@@ -45,6 +91,7 @@ export async function createStdioAgentHost(opts = {}) {
   const args = opts.args ?? [];
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxLineBytes = opts.maxLineBytes ?? DEFAULT_MAX_LINE_BYTES;
+  const replyMethodNotFound = opts.replyMethodNotFound === true;
 
   let child;
   try {
@@ -53,11 +100,10 @@ export async function createStdioAgentHost(opts = {}) {
       env: opts.env ? { ...process.env, ...opts.env } : process.env,
       windowsHide: true,
     });
-  } catch (err) {
+  } catch {
     throw phasedError('Failed to start stdio agent process', 'before_send');
   }
 
-  // Spawn can emit error asynchronously (missing binary).
   const spawnFailure = await new Promise((resolve) => {
     const onError = (err) => {
       cleanupListeners();
@@ -73,7 +119,6 @@ export async function createStdioAgentHost(opts = {}) {
     };
     child.once('error', onError);
     child.once('spawn', onSpawn);
-    // Some platforms may not emit 'spawn'; fall through shortly.
     setTimeout(() => {
       if (child.pid) {
         cleanupListeners();
@@ -89,8 +134,8 @@ export async function createStdioAgentHost(opts = {}) {
 
   let closed = false;
   let exitInfo = null;
-  const pending = new Map(); // id -> { resolve, reject, timer, onAbort }
-  // Keep a short stderr tail for local debugging; never put it into thrown messages.
+  const pending = new Map();
+  const completedIds = new Set();
   let stderrTail = '';
 
   child.stderr.setEncoding('utf8');
@@ -98,57 +143,92 @@ export async function createStdioAgentHost(opts = {}) {
     stderrTail = (stderrTail + chunk).slice(-400);
   });
 
-  child.on('exit', (code, signal) => {
-    exitInfo = { code, signal };
-    for (const [, waiters] of pending) {
-      clearTimeout(waiters.timer);
-      if (waiters.onAbort && waiters.signal) {
-        waiters.signal.removeEventListener('abort', waiters.onAbort);
-      }
-      waiters.reject(phasedError('stdio agent exited before a matching response', 'after_send'));
+  function clearWaiter(waiters) {
+    clearTimeout(waiters.timer);
+    if (waiters.onAbort && waiters.signal) {
+      waiters.signal.removeEventListener('abort', waiters.onAbort);
     }
-    pending.clear();
-  });
+  }
 
   function rejectAll(err) {
     for (const [, waiters] of pending) {
-      clearTimeout(waiters.timer);
-      if (waiters.onAbort && waiters.signal) {
-        waiters.signal.removeEventListener('abort', waiters.onAbort);
-      }
+      clearWaiter(waiters);
       waiters.reject(err);
     }
     pending.clear();
+  }
+
+  child.on('exit', (code, signal) => {
+    exitInfo = { code, signal };
+    rejectAll(phasedError('stdio agent exited before a matching response', 'after_send'));
+  });
+
+  function noteProtocolError(info) {
+    callSafe(opts.onProtocolError, info);
   }
 
   const rl = createInterface({ input: child.stdout, crlfDelay: Infinity });
   rl.on('line', (line) => {
     const bytes = Buffer.byteLength(line, 'utf8');
     if (bytes > maxLineBytes) {
+      // Oversized lines corrupt framing; fail in-flight work (existing contract).
       rejectAll(phasedError('stdio response line exceeds size limit', 'after_send'));
       return;
     }
+
     let parsed;
     try {
       parsed = JSON.parse(line);
     } catch {
-      rejectAll(phasedError('stdio response is not valid JSON', 'after_send'));
+      noteProtocolError({ kind: 'malformed', message: 'stdio line is not valid JSON' });
       return;
     }
-    const id = parsed?.id;
-    const waiters = pending.get(id);
-    if (!waiters) {
-      // A JSON-RPC object arrived, but not for any in-flight id → treat as invalid reply.
-      if (pending.size > 0) {
-        rejectAll(phasedError('stdio response id does not match the request', 'after_send'));
+
+    const kind = classifyJsonRpcMessage(parsed);
+
+    if (kind === 'notification') {
+      callSafe(opts.onNotification, parsed);
+      return;
+    }
+
+    if (kind === 'server_request') {
+      callSafe(opts.onServerRequest, parsed);
+      if (replyMethodNotFound) {
+        try {
+          const errLine = `${JSON.stringify({
+            jsonrpc: '2.0',
+            id: parsed.id,
+            error: { code: -32601, message: 'Method not found' },
+          })}\n`;
+          child.stdin.write(errLine);
+        } catch {
+          // ignore write failures for optional replies
+        }
       }
       return;
     }
-    pending.delete(id);
-    clearTimeout(waiters.timer);
-    if (waiters.onAbort && waiters.signal) {
-      waiters.signal.removeEventListener('abort', waiters.onAbort);
+
+    if (kind === 'malformed') {
+      noteProtocolError({ kind: 'malformed', message: 'stdio line is not a valid JSON-RPC 2.0 message', value: parsed });
+      return;
     }
+
+    // kind === 'response'
+    const id = parsed.id;
+    if (completedIds.has(id)) {
+      noteProtocolError({ kind: 'duplicate_response', message: 'duplicate response id', id });
+      return;
+    }
+
+    const waiters = pending.get(id);
+    if (!waiters) {
+      noteProtocolError({ kind: 'unmatched_response', message: 'response id unmatched by in-flight requests', id });
+      return;
+    }
+
+    pending.delete(id);
+    clearWaiter(waiters);
+    completedIds.add(id);
     try {
       waiters.resolve(validateJsonRpcResponse(parsed, waiters.expectedId));
     } catch (err) {
@@ -193,8 +273,8 @@ export async function createStdioAgentHost(opts = {}) {
         throw phasedError('duplicate in-flight request id', 'before_send');
       }
 
-      const line = `${JSON.stringify(request)}\n`;
-      if (Buffer.byteLength(line, 'utf8') > maxLineBytes) {
+      const outLine = `${JSON.stringify(request)}\n`;
+      if (Buffer.byteLength(outLine, 'utf8') > maxLineBytes) {
         throw phasedError('request line exceeds size limit', 'before_send');
       }
 
@@ -224,10 +304,7 @@ export async function createStdioAgentHost(opts = {}) {
         pending.set(request.id, { resolve, reject, timer, onAbort, signal, expectedId: request.id });
 
         try {
-          const ok = child.stdin.write(line);
-          if (!ok) {
-            // backpressure: still consider bytes accepted by the stream API
-          }
+          child.stdin.write(outLine);
         } catch {
           pending.delete(request.id);
           clearTimeout(timer);

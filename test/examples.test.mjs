@@ -233,11 +233,11 @@ describe('adapter examples', { concurrency: false }, () => {
     }
   });
 
-  test('stdio (d) bad JSON / id mismatch / result+error → not success, after_send', async () => {
-    for (const mode of ['bad-json', 'wrong-id', 'both-result-error']) {
+  test('stdio (d) matched invalid response → after_send; lone bad/wrong-id → unknown', async () => {
+    {
       const host = await createStdioAgentHost({
         command: process.execPath,
-        args: [mockAgentPath, mode],
+        args: [mockAgentPath, 'both-result-error'],
         timeoutMs: 2000,
         maxLineBytes: 64_000,
       });
@@ -245,7 +245,27 @@ describe('adapter examples', { concurrency: false }, () => {
         await assert.rejects(
           () => host.send(rpcRequest(5)),
           (err) => {
-            assert.equal(err.phase, 'after_send', mode);
+            assert.equal(err.phase, 'after_send');
+            assertNoSecrets(err);
+            return true;
+          },
+        );
+      } finally {
+        await host.close();
+      }
+    }
+    for (const mode of ['bad-json', 'wrong-id']) {
+      const host = await createStdioAgentHost({
+        command: process.execPath,
+        args: [mockAgentPath, mode],
+        timeoutMs: 150,
+        maxLineBytes: 64_000,
+      });
+      try {
+        await assert.rejects(
+          () => host.send(rpcRequest(5)),
+          (err) => {
+            assert.ok(err.phase === undefined || err.phase === 'unknown', `${mode} phase=${err.phase}`);
             assertNoSecrets(err);
             return true;
           },
@@ -360,5 +380,176 @@ describe('adapter examples', { concurrency: false }, () => {
       alive = false;
     }
     assert.equal(alive, false);
+  });
+
+  // ---------- stdio multiplex / JSON-RPC message classes ----------
+
+  test('stdio mux (a) notification before result → request succeeds', async () => {
+    const notes = [];
+    const host = await createStdioAgentHost({
+      command: process.execPath,
+      args: [mockAgentPath, 'notify-then-ok'],
+      timeoutMs: 2000,
+      maxLineBytes: 64_000,
+      onNotification: (msg) => notes.push(msg),
+    });
+    try {
+      const out = await host.send(rpcRequest(21));
+      assert.equal(out.id, 21);
+      assert.ok(out.result);
+      assert.equal(notes.length, 1);
+      assert.equal(notes[0].method, 'demo/log');
+      assert.equal(notes[0].id, undefined);
+    } finally {
+      await host.close();
+    }
+  });
+
+  test('stdio mux (b) server request line ignored → client request succeeds', async () => {
+    const serverReqs = [];
+    const host = await createStdioAgentHost({
+      command: process.execPath,
+      args: [mockAgentPath, 'server-req-then-ok'],
+      timeoutMs: 2000,
+      maxLineBytes: 64_000,
+      onServerRequest: (msg) => serverReqs.push(msg),
+    });
+    try {
+      const out = await host.send(rpcRequest(22));
+      assert.equal(out.id, 22);
+      assert.ok(out.result);
+      assert.equal(serverReqs.length, 1);
+      assert.equal(serverReqs[0].method, 'sampling/createMessage');
+      assert.ok(Object.prototype.hasOwnProperty.call(serverReqs[0], 'id'));
+    } finally {
+      await host.close();
+    }
+  });
+
+  test('stdio mux (c) unmatched response id → protocol error only; later match succeeds', async () => {
+    const proto = [];
+    const host = await createStdioAgentHost({
+      command: process.execPath,
+      args: [mockAgentPath, 'unmatched-then-ok'],
+      timeoutMs: 2000,
+      maxLineBytes: 64_000,
+      onProtocolError: (info) => proto.push(info),
+    });
+    try {
+      const out = await host.send(rpcRequest(23));
+      assert.equal(out.id, 23);
+      assert.ok(out.result);
+      assert.ok(proto.length >= 1);
+      assert.match(String(proto[0].message || proto[0]), /id|unmatched|orphan/i);
+    } finally {
+      await host.close();
+    }
+  });
+
+  test('stdio mux (d) duplicate response id → first wins', async () => {
+    const proto = [];
+    const host = await createStdioAgentHost({
+      command: process.execPath,
+      args: [mockAgentPath, 'duplicate-id'],
+      timeoutMs: 2000,
+      maxLineBytes: 64_000,
+      onProtocolError: (info) => proto.push(info),
+    });
+    try {
+      const out = await host.send(rpcRequest(24));
+      assert.equal(out.id, 24);
+      assert.equal(out.result.which, 'first');
+      // Second line is handled on a later turn after the first response resolves.
+      for (let i = 0; i < 20 && proto.length < 1; i++) {
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      assert.ok(proto.length >= 1);
+      assert.equal(proto[0].kind, 'duplicate_response');
+    } finally {
+      await host.close();
+    }
+  });
+
+  test('stdio mux (e) malformed line → other request still succeeds', async () => {
+    const proto = [];
+    const host = await createStdioAgentHost({
+      command: process.execPath,
+      args: [mockAgentPath, 'malformed-then-ok'],
+      timeoutMs: 2000,
+      maxLineBytes: 64_000,
+      onProtocolError: (info) => proto.push(info),
+    });
+    try {
+      const out = await host.send(rpcRequest(25));
+      assert.equal(out.id, 25);
+      assert.ok(out.result);
+      assert.ok(proto.length >= 1);
+    } finally {
+      await host.close();
+    }
+  });
+
+  test('stdio mux (f) three concurrent requests with interleaved notification all succeed', async () => {
+    const notes = [];
+    const host = await createStdioAgentHost({
+      command: process.execPath,
+      args: [mockAgentPath, 'ok-with-notify'],
+      timeoutMs: 3000,
+      maxLineBytes: 64_000,
+      onNotification: (msg) => notes.push(msg),
+    });
+    try {
+      const results = await Promise.all([
+        host.send(rpcRequest(31)),
+        host.send(rpcRequest(32)),
+        host.send(rpcRequest(33)),
+      ]);
+      assert.deepEqual(results.map((r) => r.id).sort(), [31, 32, 33]);
+      assert.ok(results.every((r) => r.result));
+      assert.ok(notes.length >= 1);
+    } finally {
+      await host.close();
+    }
+  });
+
+  test('stdio mux (g) early child exit still fails all in-flight with after_send', async () => {
+    const host = await createStdioAgentHost({
+      command: process.execPath,
+      args: [mockAgentPath, 'exit-after-read'],
+      timeoutMs: 2000,
+      maxLineBytes: 64_000,
+    });
+    try {
+      const p1 = host.send(rpcRequest(41));
+      const p2 = host.send(rpcRequest(42));
+      const errs = await Promise.allSettled([p1, p2]);
+      assert.equal(errs[0].status, 'rejected');
+      assert.equal(errs[1].status, 'rejected');
+      assert.equal(errs[0].reason.phase, 'after_send');
+      assert.equal(errs[1].reason.phase, 'after_send');
+    } finally {
+      await host.close();
+    }
+  });
+
+  test('stdio mux (h) onNotification throw does not break adapter', async () => {
+    const host = await createStdioAgentHost({
+      command: process.execPath,
+      args: [mockAgentPath, 'notify-then-ok'],
+      timeoutMs: 2000,
+      maxLineBytes: 64_000,
+      onNotification: () => {
+        throw new Error('callback boom');
+      },
+    });
+    try {
+      const out = await host.send(rpcRequest(51));
+      assert.equal(out.id, 51);
+      assert.ok(out.result);
+      const out2 = await host.send(rpcRequest(52));
+      assert.equal(out2.id, 52);
+    } finally {
+      await host.close();
+    }
   });
 });

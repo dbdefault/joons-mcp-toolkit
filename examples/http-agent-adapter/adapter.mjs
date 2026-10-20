@@ -49,6 +49,10 @@ function validateJsonRpcResponse(body, requestId) {
   if (body.jsonrpc !== '2.0') {
     throw phasedError('HTTP response jsonrpc must be "2.0"', 'after_send');
   }
+  // Notifications / server requests must not be treated as success responses.
+  if (Object.prototype.hasOwnProperty.call(body, 'method')) {
+    throw phasedError('HTTP response must not include method', 'after_send');
+  }
   if (!Object.is(body.id, requestId)) {
     throw phasedError('HTTP response id does not match the request', 'after_send');
   }
