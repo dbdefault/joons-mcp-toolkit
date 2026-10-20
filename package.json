@@ -8,6 +8,8 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "example:http": "node examples/http-agent-adapter/demo.mjs",
+    "example:stdio": "node examples/stdio-agent-adapter/demo.mjs"
   }
 }

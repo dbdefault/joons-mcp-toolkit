@@ -53,6 +53,10 @@ The built-in Node.js test runner covers concurrent same-ID calls, payload confli
 ### Design notes
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) covers routing, state transitions, trust boundaries, and deployment cautions.
 
+### Examples
+- [HTTP agent adapter](examples/http-agent-adapter/) — local JSON-RPC 2.0 POST host with phase-tagged transport errors
+- [stdio agent adapter](examples/stdio-agent-adapter/) — local newline-delimited JSON-RPC child-process host
+
 ## Quick start
 
 Requires Node.js 20 or later. No API key or cloud service is needed.
