@@ -2,7 +2,7 @@
 
 **Reference patterns for reliable AI agents, Model Context Protocol (MCP) tools, and multi-host orchestration.**
 
-> Status: early open-source reference project. The public examples are standalone and do **not** expose or require the private JOONS CORE installation. They are not a production-ready remote execution gateway.
+> Status: early open-source reference project. The public examples are standalone and do **not** expose or require any private proprietary installation. They are not a production-ready remote execution gateway.
 
 ## Why this project exists
 
@@ -47,11 +47,30 @@ The reference architecture separates **control plane** (what to run, where, unde
 ### Idempotent request coordinator
 A small dependency-free JavaScript implementation demonstrates stable request IDs, payload fingerprints, in-flight deduplication, conflicting-request rejection, explicit outcome recording, and UNKNOWN states. It is an **in-memory educational reference**, not a durable queue. See [src/request-coordinator.mjs](src/request-coordinator.mjs).
 
+### Multi-host router
+A dependency-free router sends a request to host adapters with explicit no-fallback targeting, priority-ordered fallback only for proven pre-send failures, in-memory deduplication by `requestId`, and fail-closed `UNKNOWN` when delivery is ambiguous. See [src/router.mjs](src/router.mjs) and [docs/ROUTER.md](docs/ROUTER.md).
+
+```js
+import { createRouter } from './src/router.mjs';
+
+const router = createRouter({
+  hosts: [
+    { id: 'host-a', priority: 1, async send(request) { return { ok: true }; } },
+    { id: 'host-b', priority: 2, async send(request) { return { ok: true }; } },
+  ],
+});
+
+const result = await router.route({
+  requestId: 'job-1',
+  request: { action: 'ping' },
+});
+```
+
 ### Tests
-The built-in Node.js test runner covers concurrent same-ID calls, payload conflicts, failed operations, and ambiguous transport outcomes. Run `npm test`.
+The built-in Node.js test runner covers concurrent same-ID calls, payload conflicts, failed operations, ambiguous transport outcomes, and router fallback / no-fallback contracts. Run `npm test`.
 
 ### Design notes
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) covers routing, state transitions, trust boundaries, and deployment cautions.
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) covers routing, state transitions, trust boundaries, and deployment cautions. [docs/ROUTER.md](docs/ROUTER.md) details router status transitions and phase rules.
 
 ## Quick start
 
@@ -83,9 +102,9 @@ node examples/demo.mjs
 
 ## Current scope and limitations
 
-- **Included:** reference coordinator, tests, conceptual architecture, contributing/security documentation.
+- **Included:** reference coordinator, multi-host router, tests, conceptual architecture, contributing/security documentation.
 - **Not included:** production gateway, host discovery, remote shell execution, Android client, real OAuth integration, hosted orchestration, private logs, proprietary code, or third-party agent source.
-- **Persistence:** the sample coordinator is in-memory. Restart-safe deduplication requires durable storage and an atomic dispatch protocol.
+- **Persistence:** the sample coordinator and router ledgers are in-memory. Restart-safe deduplication requires durable storage and an atomic dispatch protocol.
 - **Security:** samples illustrate contracts, not a substitute for sandboxing, authentication, authorization, secret management, or penetration testing.
 - **Benchmarks:** no public deployment or performance benchmarks are claimed.
 
@@ -93,7 +112,7 @@ node examples/demo.mjs
 
 - Persistent request ledger with transactional reservation and recovery
 - MCP JSON-RPC validation examples with adversarial fixtures
-- Host selection and explicit no-fallback routing contracts
+- Additional host-adapter examples built on the shipped router contracts
 - Portable evidence format for independent QA and code-revision checks
 - Safe examples for Hermes-style and bot-style adapters (without vendor internals)
 - Cross-platform tests and fault-injection harnesses
@@ -111,7 +130,7 @@ MIT — see [LICENSE](LICENSE).
 
 ## Provenance and transparency
 
-This public repository was created as a clean, standalone project. The private JOONS CORE system and its repositories are **not** mirrored here. The author maintains private AI orchestration tooling; claims of widespread public adoption, package downloads, external contributors, or third-party production use are **not** made.
+This public repository was created as a clean, standalone project. Private proprietary systems and repositories are **not** mirrored here. The author maintains private AI orchestration tooling; claims of widespread public adoption, package downloads, external contributors, or third-party production use are **not** made.
 
 ### About the maintainer
 
