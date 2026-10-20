@@ -424,3 +424,101 @@ test('(m) property: after a send that ends after_send/unknown, no later host is 
     }
   }
 });
+
+test('target fingerprint (a): same id+request but different target conflicts without send', async () => {
+  const a = host('host-a', { value: { from: 'a' } });
+  const b = host('host-b', { value: { from: 'b' } });
+  const router = createRouter({ hosts: [a, b] });
+  const first = await router.route({
+    requestId: 'r-tgt-a',
+    request: { op: 1 },
+    target: 'host-a',
+  });
+  assert.equal(first.status, 'SUCCEEDED');
+  assert.equal(first.host, 'host-a');
+  const second = await router.route({
+    requestId: 'r-tgt-a',
+    request: { op: 1 },
+    target: 'host-b',
+  });
+  assert.equal(second.status, 'FAILED');
+  assert.match(String(second.error?.message ?? ''), /conflict/i);
+  assert.equal(a.calls.length, 1);
+  assert.equal(b.calls.length, 0);
+});
+
+test('target fingerprint (b): omitted target vs explicit target conflicts', async () => {
+  const a = host('host-a', { priority: 1, value: { from: 'a' } });
+  const b = host('host-b', { priority: 2, value: { from: 'b' } });
+  const router = createRouter({ hosts: [a, b] });
+  await router.route({ requestId: 'r-tgt-b', request: { op: 1 } });
+  const again = await router.route({
+    requestId: 'r-tgt-b',
+    request: { op: 1 },
+    target: 'host-a',
+  });
+  assert.equal(again.status, 'FAILED');
+  assert.match(String(again.error?.message ?? ''), /conflict/i);
+  assert.equal(a.calls.length, 1);
+  assert.equal(b.calls.length, 0);
+});
+
+test('target fingerprint (c): identical id+request+target reuses recorded result', async () => {
+  const a = host('host-a', { value: { once: true } });
+  const router = createRouter({ hosts: [a] });
+  const first = await router.route({
+    requestId: 'r-tgt-c',
+    request: { op: 1 },
+    target: 'host-a',
+  });
+  const second = await router.route({
+    requestId: 'r-tgt-c',
+    request: { op: 1 },
+    target: 'host-a',
+  });
+  assert.equal(a.calls.length, 1);
+  assert.deepEqual(first, second);
+});
+
+test('target fingerprint (d): concurrent different targets → one send, other conflict', async () => {
+  let gate;
+  const release = new Promise((r) => {
+    gate = r;
+  });
+  const a = host('host-a', {
+    async send() {
+      await release;
+      return { from: 'a' };
+    },
+  });
+  const b = host('host-b', {
+    async send() {
+      return { from: 'b' };
+    },
+  });
+  const router = createRouter({ hosts: [a, b] });
+  const p1 = router.route({ requestId: 'r-tgt-d', request: { op: 1 }, target: 'host-a' });
+  // Let the first call register the in-flight record before the second starts.
+  await new Promise((r) => setTimeout(r, 5));
+  const p2 = router.route({ requestId: 'r-tgt-d', request: { op: 1 }, target: 'host-b' });
+  gate();
+  const [r1, r2] = await Promise.all([p1, p2]);
+  const statuses = [r1.status, r2.status].sort();
+  assert.deepEqual(statuses, ['FAILED', 'SUCCEEDED']);
+  const failed = r1.status === 'FAILED' ? r1 : r2;
+  assert.match(String(failed.error?.message ?? ''), /conflict/i);
+  assert.equal(a.calls.length, 1);
+  assert.equal(b.calls.length, 0);
+});
+
+test('non-serializable request returns FAILED invalid_request without send', async () => {
+  const a = host('host-a');
+  const router = createRouter({ hosts: [a] });
+  const cyclic = { n: 1 };
+  cyclic.self = cyclic;
+  const result = await router.route({ requestId: 'r-cyclic', request: cyclic });
+  assert.equal(result.status, 'FAILED');
+  assert.match(String(result.error?.message ?? ''), /invalid_request/i);
+  assert.equal(a.calls.length, 0);
+  assert.equal(result.attempts.length, 0);
+});
