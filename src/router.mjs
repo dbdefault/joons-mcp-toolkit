@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+export { HostUnavailableError, UnknownDeliveryError } from './routing-errors.mjs';
 
 const DEFAULT_MAX_RECORDS = 10_000;
 const ERROR_MESSAGE_LIMIT = 200;
@@ -114,7 +115,8 @@ export function createRouter(options = {}) {
     if (typeof host.isAvailable === 'function') {
       let available = true;
       try {
-        available = host.isAvailable() !== false;
+        // Adapters may expose sync or async availability checks.
+        available = (await Promise.resolve().then(() => host.isAvailable())) !== false;
       } catch (err) {
         return {
           attempt: { host: host.id, outcome: 'error', phase: 'before_send' },
