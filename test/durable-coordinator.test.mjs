@@ -8,6 +8,7 @@ import {
   RequestCoordinator,
   RequestConflictError,
   UnknownOutcomeError,
+  LedgerWriteError,
 } from '../src/request-coordinator.mjs';
 
 const tmp = async () => fs.mkdtemp(path.join(os.tmpdir(), 'dur-coord-'));
@@ -47,7 +48,7 @@ test('durable: UNKNOWN and FAILED replay; conflict; same-id concurrent execute o
     c.run('u', {}, async () => { const e = new Error('lost'); e.outcomeUnknown = true; throw e; }),
   );
   await assert.rejects(c.run('u', {}, async () => ({ x: 1 })), UnknownOutcomeError);
-  c.reconcile('u', { fixed: true });
+  await c.reconcile('u', { fixed: true });
   assert.deepEqual(await c.run('u', {}, async () => ({ x: 1 })), { fixed: true });
 
   await assert.rejects(
@@ -74,19 +75,64 @@ test('durable: crash while RUNNING then open yields UNKNOWN', async () => {
   const dir = await tmp();
   const ledger = await Ledger.open(dir);
   const c = new RequestCoordinator({ ledger });
+  let stop = false;
   const pending = c.run('mid', { z: 1 }, async () => {
-    await new Promise((r) => setTimeout(r, 60_000));
-    return { late: true };
+    while (!stop) await new Promise((r) => setTimeout(r, 20));
+    const err = new Error('interrupted');
+    err.outcomeUnknown = true;
+    throw err;
   });
-  await new Promise((r) => setTimeout(r, 20));
+  await new Promise((r) => setTimeout(r, 40));
   assert.equal(c.get('mid').state, 'RUNNING');
-  // simulate process loss: close without finishing (do not await pending)
+  // simulate process loss: close without finishing
   await ledger.close();
+  stop = true;
   void pending.catch(() => {});
+  await new Promise((r) => setTimeout(r, 40));
 
   const ledger2 = await Ledger.open(dir);
   assert.equal(ledger2.get('mid').state, 'UNKNOWN');
   const c2 = new RequestCoordinator({ ledger: ledger2 });
   await assert.rejects(c2.run('mid', { z: 1 }, async () => ({ x: 1 })), UnknownOutcomeError);
+  await ledger2.close();
+});
+
+test('durable: succeed write failure yields LedgerWriteError then UNKNOWN on reopen', async () => {
+  const dir = await tmp();
+  let failNextAppend = false;
+  const real = await import('node:fs/promises');
+  const deps = {
+    fs: {
+      ...real,
+      open: async (p, flags) => {
+        const handle = await real.open(p, flags);
+        if (String(p).endsWith('ledger.jsonl') && String(flags).includes('a')) {
+          return {
+            writeFile: async (data) => {
+              if (failNextAppend) throw new Error('injected succeed write failure');
+              return handle.writeFile(data);
+            },
+            sync: async () => handle.sync(),
+            close: async () => handle.close(),
+          };
+        }
+        return handle;
+      },
+    },
+  };
+  const ledger = await Ledger.open(dir, { fsync: true, deps });
+  const c = new RequestCoordinator({ ledger });
+  await assert.rejects(
+    c.run('w', { q: 1 }, async () => {
+      failNextAppend = true;
+      return { ok: true };
+    }),
+    LedgerWriteError,
+  );
+  failNextAppend = false;
+  await ledger.close();
+
+  const ledger2 = await Ledger.open(dir);
+  assert.equal(ledger2.get('w').state, 'UNKNOWN');
   await ledger2.close();
 });

@@ -15,6 +15,48 @@ const tmp = async () => fs.mkdtemp(path.join(os.tmpdir(), 'ledger-rec-'));
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const childPath = path.join(__dirname, 'helpers', 'ledger-child.mjs');
 
+function spawnChild(args) {
+  return spawn(process.execPath, [childPath, ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
+}
+
+function readFirstLine(child, timeoutMs = 10000) {
+  return new Promise((resolve, reject) => {
+    let buf = '';
+    const timer = setTimeout(() => reject(new Error('child timeout')), timeoutMs);
+    child.stdout.on('data', (d) => {
+      buf += d;
+      if (buf.includes('\n')) {
+        clearTimeout(timer);
+        resolve(buf.split('\n')[0]);
+      }
+    });
+    child.on('error', (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+  });
+}
+
+function readExit(child, timeoutMs = 15000) {
+  return new Promise((resolve, reject) => {
+    let buf = '';
+    const timer = setTimeout(() => {
+      reject(new Error(`child exit timeout buf=${buf} code=${child.exitCode}`));
+    }, timeoutMs);
+    const finish = (code) => {
+      clearTimeout(timer);
+      resolve({ buf: buf.trim(), code });
+    };
+    child.stdout.on('data', (d) => { buf += d; });
+    child.stderr.on('data', (d) => { buf += d; });
+    if (child.exitCode !== null) {
+      finish(child.exitCode);
+      return;
+    }
+    child.on('exit', finish);
+  });
+}
+
 test('restart: SUCCEEDED not re-executed; RUNNING becomes UNKNOWN', async () => {
   const dir = await tmp();
   const L = await Ledger.open(dir);
@@ -81,34 +123,109 @@ test('crc tamper and seq gap detected', async () => {
 
 test('two real processes: only one open succeeds; dead lock is taken over', async () => {
   const dir = await tmp();
-  const holder = spawn(process.execPath, [childPath, dir, 'hold'], { stdio: ['ignore', 'pipe', 'pipe'] });
-  const firstLine = await new Promise((resolve, reject) => {
-    let buf = '';
-    holder.stdout.on('data', (d) => {
-      buf += d;
-      if (buf.includes('\n')) resolve(buf.split('\n')[0]);
-    });
-    holder.on('error', reject);
-    setTimeout(() => reject(new Error('holder timeout')), 10000);
-  });
+  const staleMs = 300;
+  const holder = spawnChild([dir, 'hold', '0', String(staleMs)]);
+  const firstLine = await readFirstLine(holder, 8000);
   assert.equal(JSON.parse(firstLine).ok, true);
 
-  const challenger = spawn(process.execPath, [childPath, dir, 'try', '0'], { stdio: ['ignore', 'pipe', 'pipe'] });
-  const out = await new Promise((resolve) => {
+  // Challenger in a second real process.
+  const challenged = await new Promise((resolve, reject) => {
+    const challenger = spawnChild([dir, 'try', '0', String(staleMs)]);
     let buf = '';
+    const timer = setTimeout(() => {
+      try { challenger.kill('SIGKILL'); } catch { /* ignore */ }
+      reject(new Error(`challenger hang buf=${buf}`));
+    }, 8000);
     challenger.stdout.on('data', (d) => { buf += d; });
-    challenger.on('exit', () => resolve(buf.trim()));
+    challenger.stderr.on('data', (d) => { buf += d; });
+    challenger.on('exit', (code) => {
+      clearTimeout(timer);
+      try {
+        resolve({ ...JSON.parse(buf.trim().split('\n')[0]), code });
+      } catch (e) {
+        reject(new Error(`bad challenger output: ${buf} code=${code}`));
+      }
+    });
   });
-  const challenged = JSON.parse(out);
   assert.equal(challenged.ok, false);
   assert.equal(challenged.name, 'LedgerLockedError');
 
-  holder.kill('SIGTERM');
-  await new Promise((r) => holder.on('exit', r));
-  // allow OS to release
-  await new Promise((r) => setTimeout(r, 100));
+  // Also confirm same-process open is locked while holder lives.
+  await assert.rejects(() => Ledger.open(dir, { staleMs, lockTimeoutMs: 0 }), LedgerLockedError);
 
-  const L = await Ledger.open(dir);
+  let holderExited = holder.exitCode !== null;
+  holder.on('exit', () => { holderExited = true; });
+  try {
+    holder.kill('SIGKILL');
+  } catch {
+    try { holder.kill(); } catch { /* ignore */ }
+  }
+  for (let i = 0; i < 50 && !holderExited && holder.exitCode === null; i++) {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  assert.ok(holderExited || holder.exitCode !== null, 'holder should exit after SIGKILL');
+  // Wait past staleMs so mtime is stale (heartbeat stopped).
+  await new Promise((r) => setTimeout(r, staleMs + 200));
+
+  const L = await Ledger.open(dir, { staleMs });
   assert.ok(L);
   await L.close();
+});
+
+test('heartbeat keeps lock; external remove compromises writer', async () => {
+  const dir = await tmp();
+  const staleMs = 400;
+  const L = await Ledger.open(dir, { staleMs });
+  await L.accept('a', { n: 1 });
+
+  // Live owner longer than staleMs; another open must fail.
+  await new Promise((r) => setTimeout(r, staleMs + 200));
+  await assert.rejects(() => Ledger.open(dir, { staleMs, lockTimeoutMs: 0 }), LedgerLockedError);
+
+  // External delete of lock dir → subsequent writes rejected.
+  await fs.rm(path.join(dir, 'ledger.lock'), { recursive: true, force: true });
+  await new Promise((r) => setTimeout(r, Math.floor(staleMs / 2) + 50));
+  await assert.rejects(() => L.accept('b', { n: 2 }), (err) => {
+    assert.equal(err.name, 'LedgerLockedError');
+    assert.match(String(err.message), /lock lost/i);
+    return true;
+  });
+  await L.close();
+});
+
+test('exactly one of six processes wins a stale lock reclaim', async () => {
+  const dir = await tmp();
+  const staleMs = 300;
+  // Create a stale lock directory with a dead pid and old mtime.
+  const lockDir = path.join(dir, 'ledger.lock');
+  await fs.mkdir(lockDir);
+  await fs.writeFile(
+    path.join(lockDir, 'owner.json'),
+    JSON.stringify({ pid: 1_000_000_007, token: 'deadtoken', startedAt: new Date(0).toISOString() }),
+  );
+  const old = new Date(Date.now() - staleMs * 3);
+  await fs.utimes(lockDir, old, old);
+
+  const kids = Array.from({ length: 6 }, () => spawnChild([dir, 'steal', '0', String(staleMs)]));
+  const results = await Promise.all(kids.map(async (k) => {
+    try {
+      const line = await readFirstLine(k, 8000);
+      return JSON.parse(line);
+    } catch {
+      return { ok: false };
+    }
+  }));
+  const wins = results.filter((r) => r.ok === true);
+  assert.equal(wins.length, 1, JSON.stringify(results));
+  for (const k of kids) {
+    try {
+      k.kill('SIGKILL');
+    } catch {
+      try { k.kill(); } catch { /* ignore */ }
+    }
+  }
+  for (let i = 0; i < 50; i++) {
+    if (kids.every((k) => k.exitCode !== null)) break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
 });

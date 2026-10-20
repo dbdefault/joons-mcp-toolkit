@@ -25,10 +25,26 @@ ACCEPTED → RUNNING → SUCCEEDED
 
 ## Locking
 
-- `Ledger.open(dir)` creates `ledger.lock` with exclusive create (`wx`) and records `{ pid, token, startedAt, port }`.
-- A second live process receives `LedgerLockedError` (optional `lockTimeoutMs` retries).
-- Liveness uses the lock file plus a loopback TCP bind on a port derived from the directory path (PID-only checks are unreliable on some hosts). If the holder process exits, the port is released and the next opener may reclaim.
-- `close()` closes the lock listener and removes the lock file only when the token matches.
+- `Ledger.open(dir)` creates a `ledger.lock/` directory with non-recursive `fs.mkdir` (atomic exclusive create) and writes `owner.json` as `{ pid, token, startedAt }`.
+- While the event loop is alive, an `unref` timer every `staleMs / 2` refreshes the lock directory mtime via `fs.utimes`. Default `staleMs` is 15000 (overridable for tests).
+- Another process sees:
+  - lock present and mtime within `staleMs` → `LedgerLockedError` (optional `lockTimeoutMs` retries);
+  - mtime older than `staleMs` → stale reclaim via `fs.rename(lockDir, lockDir + '.stale-' + token)`, verify the moved mtime was really stale (otherwise `LedgerLockedError` without renaming back), remove it, then `mkdir` again.
+- `owner.json` still records `pid` for diagnostics; reclaim decisions prefer mtime so a false `ESRCH` cannot steal a live lock with a fresh heartbeat.
+- `close()` stops the heartbeat and removes the lock directory only when `owner.json` token matches.
+- If the heartbeat finds the directory gone or a foreign token, the instance is marked compromised and further writes throw `LedgerLockedError('lock lost')`.
+
+### Lock limits
+
+- If the owning process blocks the event loop longer than `staleMs`, another process may reclaim the lock.
+- After a crash, reclaim happens once mtime is older than `staleMs` (heartbeat stopped). Use a smaller `staleMs` in tests.
+- Single-host local filesystem only; network filesystems are not recommended.
+
+## RequestCoordinator + ledger
+
+- `new RequestCoordinator()` (no ledger) keeps the v0.1.0 in-memory API: `reconcile` is synchronous and returns `undefined`.
+- `new RequestCoordinator({ ledger })` is durable: `reconcile(id, result)` returns a **Promise** and updates in-memory state only after the ledger write succeeds (failure rejects and leaves memory unchanged).
+- If `execute` succeeds but persisting `succeed` fails, `run` throws `LedgerWriteError` (does not return the execute result). After restart that request becomes `UNKNOWN`.
 
 ## Recovery on open
 
@@ -48,12 +64,11 @@ const ledger = await Ledger.open(dir, { fsync: true });
 const coord = new RequestCoordinator({ ledger });
 
 const result = await coord.run('job-1', { op: 'create' }, async (payload) => {
-  // perform work; must return a receipt (not undefined)
   return { ok: true };
 });
 
-// After a crash that left UNKNOWN:
-// coord.reconcile('job-1', { ok: true });
+// After a crash that left UNKNOWN (durable reconcile is async):
+// await coord.reconcile('job-1', { ok: true });
 
 await ledger.close();
 ```
@@ -71,9 +86,10 @@ Without `{ ledger }`, `RequestCoordinator` stays in-memory and matches the v0.1.
 | Power loss + `fsync: false` | Recent events may be lost |
 | Network FS | Not recommended |
 | `UNKNOWN` | Manual `reconcile` only; no automatic retry |
-| Multi-process | One writer via `ledger.lock` |
+| Multi-process | One writer via `ledger.lock/` + heartbeat |
+| Blocked event loop > `staleMs` | Lock may be reclaimed |
 | Privacy | Fingerprints only; no raw payloads on disk |
 
 ## Korean summary (optional)
 
-추가 전용 JSONL 원장으로 요청 상태를 내구성 있게 기록합니다. 기본은 fsync 후 메모리 반영입니다. 재시작 시 RUNNING은 UNKNOWN으로 바꾸며 자동 재시도하지 않습니다. 단일 호스트 로컬 디스크를 전제로 하며, 네트워크 파일시스템은 권장하지 않습니다.
+추가 전용 JSONL 원장으로 요청 상태를 내구성 있게 기록합니다. 잠금은 `ledger.lock/` 디렉터리와 mtime 하트비트입니다. 재시작 시 RUNNING은 UNKNOWN으로 바꾸며 자동 재시도하지 않습니다. ledger가 있을 때 reconcile은 Promise이며 기록 성공 후에만 메모리를 바꿉니다.

@@ -1,16 +1,13 @@
 import { createHash } from 'node:crypto';
 
 export class RequestConflictError extends Error {
-  constructor(id) {
-    super(`Request ID conflict: ${id}`);
-    this.name = 'RequestConflictError';
-  }
+  constructor(id) { super(`Request ID conflict: ${id}`); this.name = 'RequestConflictError'; }
 }
 export class UnknownOutcomeError extends Error {
-  constructor(id, cause) {
-    super(`Outcome unknown for request ${id}`, { cause });
-    this.name = 'UnknownOutcomeError';
-  }
+  constructor(id, cause) { super(`Outcome unknown for request ${id}`, { cause }); this.name = 'UnknownOutcomeError'; }
+}
+export class LedgerWriteError extends Error {
+  constructor(message, options) { super(message, options); this.name = 'LedgerWriteError'; }
 }
 function fingerprint(payload) {
   return createHash('sha256').update(JSON.stringify(payload)).digest('hex');
@@ -95,16 +92,6 @@ export class RequestCoordinator {
   }
 
   async #runDurable(id, payload, hash, execute) {
-    const local0 = this.#records.get(id);
-    if (local0?._durableReconcile) {
-      await local0._durableReconcile;
-      delete local0._durableReconcile;
-    }
-    if (local0?.state === 'SUCCEEDED' && local0.fingerprint === hash) {
-      return local0.result;
-    }
-
-    // Terminal / conflict checks from durable state before any new accept.
     const existing = this.#ledger.get(id);
     if (existing) {
       if (existing.fingerprint !== hash) throw new RequestConflictError(id);
@@ -138,7 +125,6 @@ export class RequestCoordinator {
       if (prior.state === 'SUCCEEDED') return prior.result;
       if (prior.state === 'RUNNING' && prior.promise) return prior.promise;
       if (prior.state === 'RUNNING') throw new UnknownOutcomeError(id);
-      // ACCEPTED: continue to execute in this process
     }
 
     const record = this.#records.get(id) || { state: 'ACCEPTED', fingerprint: hash };
@@ -146,6 +132,8 @@ export class RequestCoordinator {
     if (record.promise) return record.promise;
 
     record.promise = (async () => {
+      let executed = false;
+      let execResult;
       try {
         const cur = this.#ledger.get(id);
         if (!cur) throw new Error('Missing ledger record');
@@ -165,14 +153,24 @@ export class RequestCoordinator {
           await this.#ledger.markRunning(id);
           this.#hydrate(this.#ledger.get(id));
         }
-        const result = await execute(payload);
-        if (result === undefined) throw new Error('Missing execution receipt');
-        await this.#ledger.succeed(id, result);
+        execResult = await execute(payload);
+        executed = true;
+        if (execResult === undefined) throw new Error('Missing execution receipt');
+        try {
+          await this.#ledger.succeed(id, execResult);
+        } catch (writeErr) {
+          throw new LedgerWriteError('Failed to persist success receipt', { cause: writeErr });
+        }
         this.#hydrate(this.#ledger.get(id));
-        return result;
+        return execResult;
       } catch (error) {
+        if (error instanceof LedgerWriteError) throw error;
         if (error instanceof RequestConflictError || error instanceof UnknownOutcomeError) throw error;
-        if (error?.name === 'LedgerStateError') throw error;
+        if (error?.name === 'LedgerStateError' || error?.name === 'LedgerLockedError') throw error;
+        if (executed) {
+          // execute succeeded but we are in an unexpected path — do not return success
+          throw new LedgerWriteError('Failed after execute without durable success', { cause: error });
+        }
         try {
           const st = this.#ledger.get(id)?.state;
           if (error?.outcomeUnknown === true && st === 'RUNNING') {
@@ -183,7 +181,7 @@ export class RequestCoordinator {
             this.#hydrate(this.#ledger.get(id));
           }
         } catch {
-          /* ledger may be closed during crash simulation */
+          // Ledger record of the execute failure failed; still surface the execute error.
         }
         throw error;
       }
@@ -191,20 +189,19 @@ export class RequestCoordinator {
     return record.promise;
   }
 
-  /** Deliberate reconciliation, not an implicit retry. */
+  /**
+   * Deliberate reconciliation, not an implicit retry.
+   * Without a ledger: sync, returns undefined (v0.1.0).
+   * With a ledger: returns a Promise; memory updates only after the durable write succeeds.
+   */
   reconcile(id, result) {
     const record = this.#records.get(id);
     if (!record || record.state !== 'UNKNOWN') throw new Error('Only UNKNOWN requests can be reconciled');
     if (result === undefined) throw new Error('Receipt required');
     if (this.#ledger) {
-      // Keep sync API: update memory immediately; durable write is awaited on next run().
-      const done = this.#ledger.reconcile(id, result).then((rec) => {
+      return this.#ledger.reconcile(id, result).then((rec) => {
         this.#hydrate(rec);
       });
-      record.result = result;
-      record.state = 'SUCCEEDED';
-      record._durableReconcile = done;
-      return;
     }
     record.result = result;
     record.state = 'SUCCEEDED';

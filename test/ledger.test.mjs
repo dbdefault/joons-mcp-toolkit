@@ -128,7 +128,7 @@ test('compact preserves logical state', async () => {
   await L2.close();
 });
 
-test('builtin imports only (node:)', async () => {
+test('builtin imports only (node:); ledger has no net or child_process', async () => {
   const src = await fs.readFile(new URL('../src/ledger.mjs', import.meta.url), 'utf8');
   const coord = await fs.readFile(new URL('../src/request-coordinator.mjs', import.meta.url), 'utf8');
   for (const text of [src, coord]) {
@@ -139,7 +139,10 @@ test('builtin imports only (node:)', async () => {
     }
     assert.equal(imports.some((s) => s.startsWith('node:') === false && !s.startsWith('.')), false);
   }
-  // no bare package names
   assert.equal(/\bfrom\s+['"](?!\.|node:)[^'"]+['"]/.test(src), false);
   assert.equal(/\bfrom\s+['"](?!\.|node:)[^'"]+['"]/.test(coord), false);
+  assert.equal(/node:net\b/.test(src), false);
+  assert.equal(/node:child_process\b/.test(src), false);
+  assert.equal(/\bfrom\s+['"]node:net['"]/.test(src), false);
+  assert.equal(/\bfrom\s+['"]node:child_process['"]/.test(src), false);
 });

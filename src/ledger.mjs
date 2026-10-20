@@ -1,11 +1,10 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
-import net from 'node:net';
 import path from 'node:path';
 import { RequestConflictError } from './request-coordinator.mjs';
 
 const MAX_LINE = 256 * 1024;
 const MAX_BLOB = 64 * 1024;
+const DEFAULT_STALE_MS = 15_000;
 
 export class LedgerStateError extends Error {
   constructor(message) {
@@ -40,66 +39,8 @@ function eventCrc(body) {
   return createHash('sha256').update(JSON.stringify(body)).digest('hex').slice(0, 16);
 }
 
-/**
- * Best-effort liveness check.
- * On Windows, process.kill(pid, 0) can report ESRCH for a still-living
- * process; when that happens, confirm with Get-Process before reclaiming.
- */
-function alive(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (e) {
-    if (!(e && e.code === 'ESRCH')) return true;
-  }
-  if (process.platform === 'win32') {
-    try {
-      execFileSync(
-        'powershell.exe',
-        ['-NoProfile', '-NonInteractive', '-Command', `Get-Process -Id ${pid} | Out-Null`],
-        { windowsHide: true, timeout: 5000 },
-      );
-      return true;
-    } catch {
-      return false;
-    }
-  }
-  return false;
-}
-
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
-}
-
-/** Stable ephemeral port in 49152–65535 derived from absolute dir path. */
-function lockPortFor(dir) {
-  const h = createHash('sha256').update(path.resolve(dir)).digest();
-  return 49152 + (h.readUInt16BE(0) % (65535 - 49152 + 1));
-}
-
-function listenLocal(port) {
-  return new Promise((resolve, reject) => {
-    const server = net.createServer();
-    const onError = (err) => {
-      server.removeListener('listening', onListening);
-      reject(err);
-    };
-    const onListening = () => {
-      server.removeListener('error', onError);
-      resolve(server);
-    };
-    server.once('error', onError);
-    server.once('listening', onListening);
-    server.listen(port, '127.0.0.1');
-  });
-}
-
-function closeServer(server) {
-  return new Promise((resolve) => {
-    if (!server) return resolve();
-    server.close(() => resolve());
-  });
 }
 
 function cloneRecord(r) {
@@ -111,9 +52,11 @@ function cloneRecord(r) {
     seq: r.seq,
     updatedAt: r.updatedAt,
   };
-  if (r.result !== undefined) out.result = structuredClone
-    ? structuredClone(r.result)
-    : JSON.parse(JSON.stringify(r.result));
+  if (r.result !== undefined) {
+    out.result = structuredClone
+      ? structuredClone(r.result)
+      : JSON.parse(JSON.stringify(r.result));
+  }
   if (r.error) out.error = { ...r.error };
   if (r.reason !== undefined) out.reason = r.reason;
   return out;
@@ -150,33 +93,41 @@ function errorShape(error) {
 export class Ledger {
   #dir;
   #file;
-  #lockPath;
+  #lockDir;
   #token;
   #fsync;
   #fs;
-  #lockServer = null;
+  #staleMs;
+  #heartbeat = null;
+  #compromised = false;
   #index = new Map();
   #seq = 0;
   #queue = Promise.resolve();
   #closed = false;
   recovery = null;
 
-  constructor(dir, { fsync, token, fs, recovery, lockServer }) {
+  constructor(dir, { fsync, token, fs, recovery, staleMs }) {
     this.#dir = dir;
     this.#file = path.join(dir, 'ledger.jsonl');
-    this.#lockPath = path.join(dir, 'ledger.lock');
+    this.#lockDir = path.join(dir, 'ledger.lock');
     this.#fsync = fsync;
     this.#token = token;
     this.#fs = fs;
-    this.#lockServer = lockServer || null;
+    this.#staleMs = staleMs;
     this.recovery = recovery;
   }
 
-  static async open(dir, { fsync = true, lockTimeoutMs = 0, deps = {} } = {}) {
+  static async open(dir, {
+    fsync = true,
+    lockTimeoutMs = 0,
+    staleMs = DEFAULT_STALE_MS,
+    deps = {},
+  } = {}) {
     const fs = deps.fs || await import('node:fs/promises');
     await fs.mkdir(dir, { recursive: true });
-    const { token, server } = await acquireLock(dir, lockTimeoutMs, fs);
-    const ledger = new Ledger(dir, { fsync, token, fs, recovery: null, lockServer: server });
+    const token = await acquireLock(dir, { lockTimeoutMs, staleMs }, fs);
+    const ledger = new Ledger(dir, { fsync, token, fs, recovery: null, staleMs });
+    ledger.#startHeartbeat();
     try {
       await ledger.#replay();
       return ledger;
@@ -202,7 +153,7 @@ export class Ledger {
 
   accept(id, payload) {
     return this.#enqueued(async () => {
-      this.#ensureOpen();
+      this.#ensureWritable();
       if (typeof id !== 'string' || !id.trim()) throw new TypeError('Non-empty request ID required');
       const fp = fingerprint(payload);
       const prior = this.#index.get(id);
@@ -221,7 +172,7 @@ export class Ledger {
 
   markRunning(id) {
     return this.#enqueued(async () => {
-      this.#ensureOpen();
+      this.#ensureWritable();
       const cur = this.#require(id);
       if (cur.state !== 'ACCEPTED') throw new LedgerStateError(`Cannot markRunning from ${cur.state}`);
       return this.#appendAndApply({ type: 'running', id });
@@ -230,7 +181,7 @@ export class Ledger {
 
   succeed(id, result) {
     return this.#enqueued(async () => {
-      this.#ensureOpen();
+      this.#ensureWritable();
       if (result === undefined) throw new TypeError('Receipt required');
       const cur = this.#require(id);
       if (cur.state !== 'RUNNING') throw new LedgerStateError(`Cannot succeed from ${cur.state}`);
@@ -241,7 +192,7 @@ export class Ledger {
 
   fail(id, error) {
     return this.#enqueued(async () => {
-      this.#ensureOpen();
+      this.#ensureWritable();
       const cur = this.#require(id);
       if (cur.state !== 'RUNNING') throw new LedgerStateError(`Cannot fail from ${cur.state}`);
       return this.#appendAndApply({ type: 'fail', id, error: errorShape(error) });
@@ -250,7 +201,7 @@ export class Ledger {
 
   markUnknown(id, reason) {
     return this.#enqueued(async () => {
-      this.#ensureOpen();
+      this.#ensureWritable();
       const cur = this.#require(id);
       if (cur.state !== 'RUNNING') throw new LedgerStateError(`Cannot markUnknown from ${cur.state}`);
       return this.#appendAndApply({ type: 'unknown', id, reason: String(reason ?? 'unknown') });
@@ -259,7 +210,7 @@ export class Ledger {
 
   reconcile(id, result) {
     return this.#enqueued(async () => {
-      this.#ensureOpen();
+      this.#ensureWritable();
       if (result === undefined) throw new TypeError('Receipt required');
       const cur = this.#require(id);
       if (cur.state !== 'UNKNOWN') throw new LedgerStateError(`Cannot reconcile from ${cur.state}`);
@@ -270,7 +221,7 @@ export class Ledger {
 
   async compact() {
     return this.#enqueued(async () => {
-      this.#ensureOpen();
+      this.#ensureWritable();
       const events = [];
       let seq = 0;
       for (const rec of this.#index.values()) {
@@ -306,22 +257,53 @@ export class Ledger {
 
   async close() {
     if (this.#closed) return;
-    // Drain queued writes before marking closed so in-flight appends finish.
     await this.#queue.catch(() => {});
     this.#closed = true;
-    await closeServer(this.#lockServer);
-    this.#lockServer = null;
+    if (this.#heartbeat) {
+      clearInterval(this.#heartbeat);
+      this.#heartbeat = null;
+    }
     try {
-      const raw = await this.#fs.readFile(this.#lockPath, 'utf8');
+      const raw = await this.#fs.readFile(path.join(this.#lockDir, 'owner.json'), 'utf8');
       const holder = JSON.parse(raw);
-      if (holder.token === this.#token) await this.#fs.unlink(this.#lockPath);
+      if (holder.token === this.#token) {
+        await this.#fs.rm(this.#lockDir, { recursive: true, force: true });
+      }
     } catch {
       /* ignore */
     }
   }
 
-  #ensureOpen() {
+  #startHeartbeat() {
+    const interval = Math.max(50, Math.floor(this.#staleMs / 2));
+    this.#heartbeat = setInterval(() => {
+      this.#touchLock().catch(() => {
+        this.#compromised = true;
+      });
+    }, interval);
+    this.#heartbeat.unref();
+  }
+
+  async #touchLock() {
+    if (this.#closed || this.#compromised) return;
+    try {
+      const ownerPath = path.join(this.#lockDir, 'owner.json');
+      const raw = await this.#fs.readFile(ownerPath, 'utf8');
+      const holder = JSON.parse(raw);
+      if (holder.token !== this.#token) {
+        this.#compromised = true;
+        return;
+      }
+      const now = new Date();
+      await this.#fs.utimes(this.#lockDir, now, now);
+    } catch {
+      this.#compromised = true;
+    }
+  }
+
+  #ensureWritable() {
     if (this.#closed) throw new Error('Ledger is closed');
+    if (this.#compromised) throw new LedgerLockedError('lock lost');
   }
 
   #require(id) {
@@ -438,12 +420,9 @@ export class Ledger {
       const line = lines[i];
       const isLast = i === lines.length - 1;
       let event;
-      let parsed = false;
       try {
         event = JSON.parse(line);
-        parsed = true;
       } catch (e) {
-        // Incomplete trailing write only: truncate. Middle parse failure is corruption.
         if (isLast) {
           this.recovery = { truncatedBytes: text.length - goodEnd };
           await this.#fs.truncate(this.#file, goodEnd);
@@ -457,10 +436,8 @@ export class Ledger {
         if (crc !== eventCrc(rest)) throw new Error('bad crc');
         if (event.seq !== expected) throw new Error(`seq gap want ${expected} got ${event.seq}`);
       } catch (e) {
-        // Valid JSON with bad crc/seq is always corruption (even if last line).
         throw new LedgerCorruptError(`corrupt ledger at line ${i + 1}: ${e.message}`);
       }
-      if (!parsed) continue;
       this.#apply(event);
       this.#seq = event.seq;
       expected += 1;
@@ -475,90 +452,99 @@ export class Ledger {
   }
 }
 
-async function acquireLock(dir, lockTimeoutMs, fs) {
-  const lockPath = path.join(dir, 'ledger.lock');
-  const port = lockPortFor(dir);
+async function readOwner(lockDir, fs) {
+  try {
+    return JSON.parse(await fs.readFile(path.join(lockDir, 'owner.json'), 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+async function createLockDir(lockDir, token, fs) {
+  await fs.mkdir(lockDir);
+  const owner = {
+    pid: process.pid,
+    token,
+    startedAt: new Date().toISOString(),
+  };
+  await fs.writeFile(path.join(lockDir, 'owner.json'), JSON.stringify(owner), 'utf8');
+  const now = new Date();
+  try {
+    await fs.utimes(lockDir, now, now);
+  } catch {
+    /* ignore */
+  }
+  return token;
+}
+
+async function acquireLock(dir, { lockTimeoutMs, staleMs }, fs) {
+  const lockDir = path.join(dir, 'ledger.lock');
   const token = randomBytes(16).toString('hex');
   const started = Date.now();
-  let reclaimAttempted = false;
+  let spins = 0;
+
   for (;;) {
+    if (++spins > 10_000) throw new LedgerLockedError('lock acquire spin limit');
     try {
-      const handle = await fs.open(lockPath, 'wx');
-      let server = null;
-      try {
-        server = await listenLocal(port);
-        await handle.writeFile(
-          JSON.stringify({
-            pid: process.pid,
-            token,
-            startedAt: new Date().toISOString(),
-            port,
-          }),
-          'utf8',
-        );
-        if (typeof handle.sync === 'function') {
-          try {
-            await handle.sync();
-          } catch {
-            /* sync optional on some fs mocks */
-          }
-        }
-      } catch (inner) {
-        await handle.close().catch(() => {});
-        await closeServer(server);
-        try {
-          await fs.unlink(lockPath);
-        } catch {
-          /* ignore */
-        }
-        throw inner;
-      }
-      await handle.close();
-      return { token, server };
+      await createLockDir(lockDir, token, fs);
+      return token;
     } catch (e) {
       if (e.code !== 'EEXIST') throw e;
 
-      // Prefer TCP probe: if the lock port is bound, the holder is alive.
-      let probe = null;
+      let st = null;
       try {
-        probe = await listenLocal(port);
-        await closeServer(probe);
-        probe = null;
-        // Port free → treat lock file as stale (pid check is unreliable on Windows).
-      } catch (le) {
-        if (le && le.code === 'EADDRINUSE') {
-          if (!lockTimeoutMs || lockTimeoutMs <= 0) throw new LedgerLockedError();
-          if (Date.now() - started >= lockTimeoutMs) throw new LedgerLockedError();
-          await sleep(50);
-          continue;
-        }
-        // Probe failed for another reason: fall back to pid liveness.
-        let holder = null;
-        try {
-          holder = JSON.parse(await fs.readFile(lockPath, 'utf8'));
-        } catch {
-          holder = null;
-        }
-        if (holder && alive(holder.pid)) {
-          if (!lockTimeoutMs || lockTimeoutMs <= 0) throw new LedgerLockedError();
-          if (Date.now() - started >= lockTimeoutMs) throw new LedgerLockedError();
-          await sleep(50);
-          continue;
-        }
+        st = await fs.stat(lockDir);
+      } catch (se) {
+        if (se && se.code === 'ENOENT') continue;
+        throw se;
       }
 
-      if (!reclaimAttempted) {
-        reclaimAttempted = true;
+      const age = Date.now() - st.mtimeMs;
+      const fresh = age <= staleMs;
+
+      // Fresh mtime always means the lock is held. Do not reclaim on pid probes
+      // alone (process.kill ESRCH is not reliable on every host while mtime is fresh).
+      // After a crash the heartbeat stops; reclaim once mtime is older than staleMs.
+      if (fresh) {
+        if (!lockTimeoutMs || lockTimeoutMs <= 0) throw new LedgerLockedError();
+        if (Date.now() - started >= lockTimeoutMs) throw new LedgerLockedError();
+        await sleep(50);
+        continue;
+      }
+
+      // mtime older than staleMs → reclaim.
+      const staleName = `${lockDir}.stale-${token}`;
+      try {
+        await fs.rename(lockDir, staleName);
+      } catch (re) {
+        if (re && re.code === 'ENOENT') continue;
+        throw re;
+      }
+
+      let movedStat = null;
+      try {
+        movedStat = await fs.stat(staleName);
+      } catch {
+        movedStat = null;
+      }
+      const movedAge = movedStat ? Date.now() - movedStat.mtimeMs : Infinity;
+
+      // After rename, mtime must really have been stale; do not rename back.
+      if (movedAge <= staleMs) {
         try {
-          await fs.unlink(lockPath);
+          await fs.rm(staleName, { recursive: true, force: true });
         } catch {
           /* ignore */
         }
-        continue;
+        throw new LedgerLockedError();
       }
-      if (!lockTimeoutMs || lockTimeoutMs <= 0) throw new LedgerLockedError();
-      if (Date.now() - started >= lockTimeoutMs) throw new LedgerLockedError();
-      await sleep(50);
+
+      try {
+        await fs.rm(staleName, { recursive: true, force: true });
+      } catch {
+        /* ignore */
+      }
+      // Loop and mkdir.
     }
   }
 }
