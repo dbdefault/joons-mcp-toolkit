@@ -121,14 +121,14 @@ test('crc tamper and seq gap detected', async () => {
   await assert.rejects(() => Ledger.open(dir2), LedgerCorruptError);
 });
 
-test('two real processes: only one open succeeds; dead lock is taken over', async () => {
+test('two real processes: only one open succeeds', async () => {
   const dir = await tmp();
-  const staleMs = 300;
+  // Large staleMs so heartbeat (staleMs/2) tolerates load jitter.
+  const staleMs = 2000;
   const holder = spawnChild([dir, 'hold', '0', String(staleMs)]);
   const firstLine = await readFirstLine(holder, 8000);
   assert.equal(JSON.parse(firstLine).ok, true);
 
-  // Challenger in a second real process.
   const challenged = await new Promise((resolve, reject) => {
     const challenger = spawnChild([dir, 'try', '0', String(staleMs)]);
     let buf = '';
@@ -149,8 +149,6 @@ test('two real processes: only one open succeeds; dead lock is taken over', asyn
   });
   assert.equal(challenged.ok, false);
   assert.equal(challenged.name, 'LedgerLockedError');
-
-  // Also confirm same-process open is locked while holder lives.
   await assert.rejects(() => Ledger.open(dir, { staleMs, lockTimeoutMs: 0 }), LedgerLockedError);
 
   let holderExited = holder.exitCode !== null;
@@ -164,9 +162,51 @@ test('two real processes: only one open succeeds; dead lock is taken over', asyn
     await new Promise((r) => setTimeout(r, 100));
   }
   assert.ok(holderExited || holder.exitCode !== null, 'holder should exit after SIGKILL');
-  // Wait past staleMs so mtime is stale (heartbeat stopped).
-  await new Promise((r) => setTimeout(r, staleMs + 200));
+});
 
+test('dead owner lock is taken over via ESRCH without waiting 4x staleMs', async () => {
+  const dir = await tmp();
+  const staleMs = 300;
+  const holder = spawnChild([dir, 'hold', '0', String(staleMs)]);
+  const firstLine = await readFirstLine(holder, 8000);
+  assert.equal(JSON.parse(firstLine).ok, true);
+
+  let holderExited = holder.exitCode !== null;
+  holder.on('exit', () => { holderExited = true; });
+  try {
+    holder.kill('SIGKILL');
+  } catch {
+    try { holder.kill(); } catch { /* ignore */ }
+  }
+  for (let i = 0; i < 50 && !holderExited && holder.exitCode === null; i++) {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  assert.ok(holderExited || holder.exitCode !== null, 'holder should exit after SIGKILL');
+  // ESRCH reclaim requires age > staleMs/2 (missed heartbeat); still far below 4×staleMs.
+  await new Promise((r) => setTimeout(r, staleMs / 2 + 100));
+
+  const L = await Ledger.open(dir, { staleMs });
+  assert.ok(L);
+  await L.close();
+});
+
+test('live pid: mtime between staleMs and 4x is locked; beyond 4x is reclaimable', async () => {
+  const dir = await tmp();
+  const staleMs = 200;
+  const lockDir = path.join(dir, 'ledger.lock');
+  await fs.mkdir(lockDir);
+  // Use this process pid so the owner is definitely alive.
+  await fs.writeFile(
+    path.join(lockDir, 'owner.json'),
+    JSON.stringify({ pid: process.pid, token: 'livetoken', startedAt: new Date().toISOString() }),
+  );
+
+  const mid = new Date(Date.now() - staleMs * 3);
+  await fs.utimes(lockDir, mid, mid);
+  await assert.rejects(() => Ledger.open(dir, { staleMs, lockTimeoutMs: 0 }), LedgerLockedError);
+
+  const old = new Date(Date.now() - staleMs * 5);
+  await fs.utimes(lockDir, old, old);
   const L = await Ledger.open(dir, { staleMs });
   assert.ok(L);
   await L.close();
@@ -178,7 +218,7 @@ test('heartbeat keeps lock; external remove compromises writer', async () => {
   const L = await Ledger.open(dir, { staleMs });
   await L.accept('a', { n: 1 });
 
-  // Live owner longer than staleMs; another open must fail.
+  // Live owner longer than staleMs but under 4×staleMs; another open must fail.
   await new Promise((r) => setTimeout(r, staleMs + 200));
   await assert.rejects(() => Ledger.open(dir, { staleMs, lockTimeoutMs: 0 }), LedgerLockedError);
 
@@ -228,4 +268,38 @@ test('exactly one of six processes wins a stale lock reclaim', async () => {
     if (kids.every((k) => k.exitCode !== null)) break;
     await new Promise((r) => setTimeout(r, 100));
   }
+});
+
+test('stale rename race: challenger must not delete winner lock', async () => {
+  const dir = await tmp();
+  const staleMs = 200;
+  const lockDir = path.join(dir, 'ledger.lock');
+  await fs.mkdir(lockDir);
+  const staleOwner = {
+    pid: 1_000_000_007,
+    token: 'stale-original',
+    startedAt: new Date(0).toISOString(),
+  };
+  await fs.writeFile(path.join(lockDir, 'owner.json'), JSON.stringify(staleOwner));
+  const old = new Date(Date.now() - staleMs * 5);
+  await fs.utimes(lockDir, old, old);
+
+  let winner = null;
+  const loser = Ledger.open(dir, {
+    staleMs,
+    lockTimeoutMs: 0,
+    deps: {
+      beforeStaleRename: async () => {
+        // A wins first: reclaim and install a fresh lock before B renames.
+        winner = await Ledger.open(dir, { staleMs, lockTimeoutMs: 0 });
+      },
+    },
+  });
+
+  await assert.rejects(() => loser, LedgerLockedError);
+  assert.ok(winner);
+  const owner = JSON.parse(await fs.readFile(path.join(lockDir, 'owner.json'), 'utf8'));
+  assert.notEqual(owner.token, 'stale-original');
+  assert.equal(owner.pid, process.pid);
+  await winner.close();
 });

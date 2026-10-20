@@ -43,6 +43,20 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/** True only when process.kill(pid, 0) reports ESRCH (process is gone). */
+function pidDefinitelyDead(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return true;
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (e) {
+    return !!(e && e.code === 'ESRCH');
+  }
+}
+
+/** Live (or EPERM) owners are stale only after this multiple of staleMs. */
+const STALE_LIVE_MULTIPLIER = 4;
+
 function cloneRecord(r) {
   if (!r) return null;
   const out = {
@@ -125,7 +139,11 @@ export class Ledger {
   } = {}) {
     const fs = deps.fs || await import('node:fs/promises');
     await fs.mkdir(dir, { recursive: true });
-    const token = await acquireLock(dir, { lockTimeoutMs, staleMs }, fs);
+    const token = await acquireLock(dir, {
+      lockTimeoutMs,
+      staleMs,
+      beforeStaleRename: deps.beforeStaleRename,
+    }, fs);
     const ledger = new Ledger(dir, { fsync, token, fs, recovery: null, staleMs });
     ledger.#startHeartbeat();
     try {
@@ -477,11 +495,13 @@ async function createLockDir(lockDir, token, fs) {
   return token;
 }
 
-async function acquireLock(dir, { lockTimeoutMs, staleMs }, fs) {
+async function acquireLock(dir, { lockTimeoutMs, staleMs, beforeStaleRename }, fs) {
   const lockDir = path.join(dir, 'ledger.lock');
   const token = randomBytes(16).toString('hex');
   const started = Date.now();
   let spins = 0;
+  const liveStaleAfter = STALE_LIVE_MULTIPLIER * staleMs;
+  const esrchGrace = staleMs / 2;
 
   for (;;) {
     if (++spins > 10_000) throw new LedgerLockedError('lock acquire spin limit');
@@ -500,25 +520,64 @@ async function acquireLock(dir, { lockTimeoutMs, staleMs }, fs) {
       }
 
       const age = Date.now() - st.mtimeMs;
-      const fresh = age <= staleMs;
+      const owner = await readOwner(lockDir, fs);
+      const rememberedToken = owner && typeof owner.token === 'string' ? owner.token : '';
+      const dead = owner ? pidDefinitelyDead(owner.pid) : true;
+      // ① ESRCH after at least one missed heartbeat (age > staleMs/2) → reclaim.
+      //    (fresh mtime + ESRCH alone is ignored: hosts may report false ESRCH.)
+      // ② Live/EPERM → only after 4×staleMs mtime age.
+      const reclaimable = (dead && age > esrchGrace) || (!dead && age > liveStaleAfter);
 
-      // Fresh mtime always means the lock is held. Do not reclaim on pid probes
-      // alone (process.kill ESRCH is not reliable on every host while mtime is fresh).
-      // After a crash the heartbeat stops; reclaim once mtime is older than staleMs.
-      if (fresh) {
+      if (!reclaimable) {
         if (!lockTimeoutMs || lockTimeoutMs <= 0) throw new LedgerLockedError();
         if (Date.now() - started >= lockTimeoutMs) throw new LedgerLockedError();
         await sleep(50);
         continue;
       }
 
-      // mtime older than staleMs → reclaim.
+      if (typeof beforeStaleRename === 'function') {
+        await beforeStaleRename({ lockDir, rememberedToken, staleMs });
+      }
+
       const staleName = `${lockDir}.stale-${token}`;
       try {
         await fs.rename(lockDir, staleName);
       } catch (re) {
         if (re && re.code === 'ENOENT') continue;
         throw re;
+      }
+
+      const movedOwner = await readOwner(staleName, fs);
+      const movedToken = movedOwner && typeof movedOwner.token === 'string' ? movedOwner.token : '';
+
+      // Only delete if we moved the same stale lock we inspected (token match).
+      if (movedToken !== rememberedToken) {
+        let restored = false;
+        let restoreErr = null;
+        try {
+          await fs.stat(lockDir);
+          // Original name occupied — leave the moved dir in place; do not delete.
+        } catch (se) {
+          if (se && se.code === 'ENOENT') {
+            try {
+              await fs.rename(staleName, lockDir);
+              restored = true;
+            } catch (re2) {
+              restoreErr = re2;
+            }
+          } else {
+            restoreErr = se;
+          }
+        }
+        if (restored) {
+          throw new LedgerLockedError('stale rename raced; restored foreign lock');
+        }
+        if (restoreErr) {
+          throw new LedgerLockedError(
+            `stale rename raced; restore failed: ${restoreErr.message || restoreErr}`,
+          );
+        }
+        throw new LedgerLockedError('stale rename raced; left moved lock in place');
       }
 
       let movedStat = null;
@@ -528,13 +587,26 @@ async function acquireLock(dir, { lockTimeoutMs, staleMs }, fs) {
         movedStat = null;
       }
       const movedAge = movedStat ? Date.now() - movedStat.mtimeMs : Infinity;
+      const movedDead = movedOwner ? pidDefinitelyDead(movedOwner.pid) : true;
+      const stillReclaimable =
+        (movedDead && movedAge > esrchGrace) || (!movedDead && movedAge > liveStaleAfter);
 
-      // After rename, mtime must really have been stale; do not rename back.
-      if (movedAge <= staleMs) {
+      if (!stillReclaimable) {
+        let lockExists = true;
         try {
-          await fs.rm(staleName, { recursive: true, force: true });
-        } catch {
-          /* ignore */
+          await fs.stat(lockDir);
+        } catch (se) {
+          if (se && se.code === 'ENOENT') lockExists = false;
+          else throw se;
+        }
+        if (!lockExists) {
+          try {
+            await fs.rename(staleName, lockDir);
+          } catch (re2) {
+            throw new LedgerLockedError(
+              `stale criteria failed; restore failed: ${re2.message || re2}`,
+            );
+          }
         }
         throw new LedgerLockedError();
       }

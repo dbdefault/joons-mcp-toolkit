@@ -27,17 +27,18 @@ ACCEPTED → RUNNING → SUCCEEDED
 
 - `Ledger.open(dir)` creates a `ledger.lock/` directory with non-recursive `fs.mkdir` (atomic exclusive create) and writes `owner.json` as `{ pid, token, startedAt }`.
 - While the event loop is alive, an `unref` timer every `staleMs / 2` refreshes the lock directory mtime via `fs.utimes`. Default `staleMs` is 15000 (overridable for tests).
-- Another process sees:
-  - lock present and mtime within `staleMs` → `LedgerLockedError` (optional `lockTimeoutMs` retries);
-  - mtime older than `staleMs` → stale reclaim via `fs.rename(lockDir, lockDir + '.stale-' + token)`, verify the moved mtime was really stale (otherwise `LedgerLockedError` without renaming back), remove it, then `mkdir` again.
-- `owner.json` still records `pid` for diagnostics; reclaim decisions prefer mtime so a false `ESRCH` cannot steal a live lock with a fresh heartbeat.
+- Another process reclaims only when:
+  1. `process.kill(owner.pid, 0)` yields `ESRCH` **and** mtime age is greater than **`staleMs / 2`** (at least one missed heartbeat; avoids false `ESRCH` stealing a freshly heartbeated lock); or
+  2. the owner still appears alive (success or `EPERM`) **and** mtime is older than **`4 × staleMs`** (margin for heartbeat delay under load).
+- Reclaim remembers the inspected `owner.json` token, `rename`s to `lockDir + '.stale-' + <challengerToken>`, and **deletes only if the moved directory’s token still matches**. If it differs (another process already installed a new lock that was renamed by mistake), restore when `ledger.lock` is empty, otherwise leave the moved directory in place and throw `LedgerLockedError` (never delete a foreign lock).
 - `close()` stops the heartbeat and removes the lock directory only when `owner.json` token matches.
 - If the heartbeat finds the directory gone or a foreign token, the instance is marked compromised and further writes throw `LedgerLockedError('lock lost')`.
 
 ### Lock limits
 
-- If the owning process blocks the event loop longer than `staleMs`, another process may reclaim the lock.
-- After a crash, reclaim happens once mtime is older than `staleMs` (heartbeat stopped). Use a smaller `staleMs` in tests.
+- If the owning process blocks the event loop longer than **`4 × staleMs`** (60s with the default), or heartbeat delay pushes mtime past the reclaim threshold while the pid still looks alive, another process may reclaim the lock. The displaced owner becomes **compromised** on the next heartbeat/write and subsequent writes are rejected.
+- After a crash: reclaim proceeds once `ESRCH` is observed and mtime shows a missed heartbeat (`> staleMs / 2`). If the pid was reused by an unrelated live process, wait up to **`4 × staleMs`** for mtime-based reclaim.
+- A theoretical race where reclaim overlaps the owner’s last durable write is not prevented by distributed consensus; append `seq`/`crc` replay can **detect** torn history but does not prevent the overlap. This ledger assumes a **single-host local filesystem**, not a networked multi-writer store.
 - Single-host local filesystem only; network filesystems are not recommended.
 
 ## RequestCoordinator + ledger
@@ -92,4 +93,4 @@ Without `{ ledger }`, `RequestCoordinator` stays in-memory and matches the v0.1.
 
 ## Korean summary (optional)
 
-추가 전용 JSONL 원장으로 요청 상태를 내구성 있게 기록합니다. 잠금은 `ledger.lock/` 디렉터리와 mtime 하트비트입니다. 재시작 시 RUNNING은 UNKNOWN으로 바꾸며 자동 재시도하지 않습니다. ledger가 있을 때 reconcile은 Promise이며 기록 성공 후에만 메모리를 바꿉니다.
+추가 전용 JSONL 원장으로 요청 상태를 내구성 있게 기록합니다. 잠금은 `ledger.lock/` 디렉터리와 mtime 하트비트이며, 산 프로세스는 `4×staleMs` 이후, ESRCH는 하트비트 1회 분(`staleMs/2`) 초과 시에만 인수합니다. stale rename은 owner token이 같을 때만 삭제합니다.
