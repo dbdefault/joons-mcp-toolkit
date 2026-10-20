@@ -4,8 +4,13 @@ export { HostUnavailableError, UnknownDeliveryError } from './routing-errors.mjs
 const DEFAULT_MAX_RECORDS = 10_000;
 const ERROR_MESSAGE_LIMIT = 200;
 
-function fingerprint(value) {
-  return createHash('sha256').update(JSON.stringify(value)).digest('hex');
+function fingerprint(request, target) {
+  // Include target in the ledger key so explicit host selection cannot reuse another
+  // target's recorded outcome. Omitted/null/undefined target share one normalized slot.
+  const targetKey = target == null ? null : String(target);
+  return createHash('sha256')
+    .update(JSON.stringify({ request, target: targetKey }))
+    .digest('hex');
 }
 
 function sanitizeMessage(input) {
@@ -253,7 +258,17 @@ export function createRouter(options = {}) {
       };
     }
 
-    const hash = fingerprint(request);
+    let hash;
+    try {
+      hash = fingerprint(request, target);
+    } catch {
+      return {
+        status: 'FAILED',
+        host: null,
+        attempts: [],
+        error: { message: 'invalid_request' },
+      };
+    }
     const prior = getRecord(requestId);
     if (prior) {
       if (prior.fingerprint !== hash) {
@@ -261,7 +276,7 @@ export function createRouter(options = {}) {
           status: 'FAILED',
           host: prior.result?.host ?? null,
           attempts: prior.result?.attempts ? prior.result.attempts.slice() : [],
-          error: { message: 'conflict: same requestId with different request' },
+          error: { message: 'conflict: same requestId with different request or target' },
         };
       }
       if (prior.settled) {
