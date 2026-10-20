@@ -1,0 +1,13 @@
+{
+  "name": "joons-mcp-toolkit",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Open-source reference patterns for reliable MCP and AI orchestration",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test"
+  }
+}
