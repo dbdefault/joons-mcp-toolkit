@@ -48,7 +48,7 @@ The reference architecture separates **control plane** (what to run, where, unde
 A small dependency-free JavaScript implementation demonstrates stable request IDs, payload fingerprints, in-flight deduplication, conflicting-request rejection, explicit outcome recording, and UNKNOWN states. It is an **in-memory educational reference**, not a durable queue. See [src/request-coordinator.mjs](src/request-coordinator.mjs).
 
 ### Multi-host router
-A dependency-free router sends a request to host adapters with explicit no-fallback targeting, priority-ordered fallback only for proven pre-send failures, in-memory deduplication by `requestId`, and fail-closed `UNKNOWN` when delivery is ambiguous. See [src/router.mjs](src/router.mjs) and [docs/ROUTER.md](docs/ROUTER.md).
+A dependency-free router sends a request to host adapters with explicit no-fallback targeting, priority-ordered fallback only for proven pre-send failures, in-memory deduplication by `requestId`, and fail-closed `UNKNOWN` when delivery is ambiguous. See [src/router.mjs](src/router.mjs) and [docs/ROUTER.md](docs/ROUTER.md). `src/host-router.mjs` is a compatibility facade that preserves the earlier `createHostRouter` export on top of this core.
 
 ```js
 import { createRouter } from './src/router.mjs';

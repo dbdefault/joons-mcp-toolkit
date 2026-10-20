@@ -6,7 +6,7 @@ A job begins as a request with a stable identifier and a canonical description. 
 
 ## Host routing
 
-A routing decision should record the requested host, selected host, authorization decision, transport attempt, and whether bytes were sent. Explicit host selection is not permission to fallback to another host. Automatic failover is only safe when the system can prove no side effect occurred or when an operation has durable idempotency at the receiving end.
+Routing semantics for this repository live in [ROUTER.md](./ROUTER.md). In short: record the requested host, selected host, and whether dispatch may have started; an explicit target must not silently change hosts; automatic failover is only safe when the system can prove no side effect occurred (or the operation is durably idempotent). The implementation core is `src/router.mjs`; `src/host-router.mjs` is a compatibility facade over that core.
 
 ## Verification
 

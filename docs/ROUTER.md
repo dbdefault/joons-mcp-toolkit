@@ -94,9 +94,28 @@ Once a send may have started, another host must not execute the same `requestId`
 - Synchronous throws from `send` are caught.
 - Optional `AbortSignal`: abort detected **before** calling `send` is treated like `before_send` (fallback allowed when target is unset). Ambiguity after send remains `UNKNOWN`.
 
+## Legacy compatibility facade (`createHostRouter`)
+
+`src/host-router.mjs` keeps the earlier public export names and call shape. It is a thin wrapper over `createRouter`.
+
+| Legacy (`host-router`) | Core (`router`) |
+|---|---|
+| `hosts: string[]` | `hosts: [{ id, priority: index, isAvailable, send }]` |
+| `isAvailable(id)` | `host.isAvailable()` closes over that `id` (sync or async) |
+| `invoke(id, operation)` | `host.send(operation)` calls `invoke` |
+| `call(operation, { targetHost })` | `route({ requestId, request: operation, target: targetHost })` |
+| throws `HostUnavailableError` | core `FAILED` (unknown / unavailable / all pre-send failures) |
+| throws `UnknownDeliveryError` | core `UNKNOWN` |
+| returns invoke value | core `SUCCEEDED` → `value` |
+
+Semantic difference: the legacy facade **always** treats an `invoke` throw as uncertain delivery. It overwrites any `error.phase` (including `before_send`) before the error reaches the core, so the core must not fall back to another host on that path. Shared error classes live in `src/routing-errors.mjs` and are re-exported from both modules so `instanceof` matches.
+
+Each legacy `call` uses a fresh `requestId`, so the core’s request-id ledger does not dedupe successive facade calls. The core still caps completed in-memory records.
+
 ## Limits
 
 - No durable ledger across process restarts.
 - No built-in network client, discovery, auth, or MCP session management.
 - Host adapters are responsible for real transport semantics and honest `phase` labeling.
 - Custom stores must implement their own retention if they ignore the default eviction path.
+- The legacy facade intentionally disables pre-send fallback after `invoke` throws; prefer `createRouter` when adapters can label `before_send` honestly.
