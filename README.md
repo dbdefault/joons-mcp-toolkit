@@ -47,6 +47,9 @@ The reference architecture separates **control plane** (what to run, where, unde
 ### Idempotent request coordinator
 A small dependency-free JavaScript implementation demonstrates stable request IDs, payload fingerprints, in-flight deduplication, conflicting-request rejection, explicit outcome recording, and UNKNOWN states. It is an **in-memory educational reference**, not a durable queue. See [src/request-coordinator.mjs](src/request-coordinator.mjs).
 
+### Hybrid retrieval (keyword + embeddings + optional rerank)
+A small dependency-free module for searching notes and documents that agents rely on. It combines a BM25-style keyword ranker with embedding similarity, fuses the two rankings with reciprocal rank fusion, and optionally applies a rerank stage. Embedding and rerank providers are injected, so a hosted API or a self-hosted small model can be swapped in; `httpEmbedder` talks to any OpenAI-compatible `/embeddings` endpoint using a URL, key and model supplied by the caller. A malformed provider response is rejected rather than treated as an empty success. It runs offline with a hashing embedder (`node examples/search-demo.mjs`) and is an **in-memory educational reference**, not a production index. See [src/hybrid-retrieval.mjs](src/hybrid-retrieval.mjs).
+
 ### Tests
 The built-in Node.js test runner covers concurrent same-ID calls, payload conflicts, failed operations, and ambiguous transport outcomes. Run `npm test`.
 
@@ -83,7 +86,7 @@ node examples/demo.mjs
 
 ## Current scope and limitations
 
-- **Included:** reference coordinator, tests, conceptual architecture, contributing/security documentation.
+- **Included:** reference coordinator, hybrid retrieval module, tests, conceptual architecture, contributing/security documentation.
 - **Not included:** production gateway, host discovery, remote shell execution, Android client, real OAuth integration, hosted orchestration, private logs, proprietary code, or third-party agent source.
 - **Persistence:** the sample coordinator is in-memory. Restart-safe deduplication requires durable storage and an atomic dispatch protocol.
 - **Security:** samples illustrate contracts, not a substitute for sandboxing, authentication, authorization, secret management, or penetration testing.
