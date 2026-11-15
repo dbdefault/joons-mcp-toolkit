@@ -495,6 +495,38 @@ async function createLockDir(lockDir, token, fs) {
   return token;
 }
 
+/**
+ * Run fn while holding `<lockDir>.reclaim` (atomic mkdir). Returns 'busy' when
+ * another process is reclaiming. A mutex left by a crashed reclaimer is removed
+ * once it is clearly older than any reclaim could take.
+ */
+async function withReclaimMutex(lockDir, staleMs, fs, fn) {
+  const mutex = `${lockDir}.reclaim`;
+  try {
+    await fs.mkdir(mutex);
+  } catch (e) {
+    if (!e || e.code !== 'EEXIST') throw e;
+    try {
+      const st = await fs.stat(mutex);
+      if (Date.now() - st.mtimeMs > Math.max(4 * staleMs, 2000)) {
+        await fs.rm(mutex, { recursive: true, force: true });
+      }
+    } catch {
+      /* ignore */
+    }
+    return 'busy';
+  }
+  try {
+    return await fn();
+  } finally {
+    try {
+      await fs.rm(mutex, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
 async function acquireLock(dir, { lockTimeoutMs, staleMs, beforeStaleRename }, fs) {
   const lockDir = path.join(dir, 'ledger.lock');
   const token = randomBytes(16).toString('hex');
@@ -539,84 +571,110 @@ async function acquireLock(dir, { lockTimeoutMs, staleMs, beforeStaleRename }, f
         await beforeStaleRename({ lockDir, rememberedToken, staleMs });
       }
 
-      const staleName = `${lockDir}.stale-${token}`;
-      try {
-        await fs.rename(lockDir, staleName);
-      } catch (re) {
-        if (re && re.code === 'ENOENT') continue;
-        throw re;
-      }
-
-      const movedOwner = await readOwner(staleName, fs);
-      const movedToken = movedOwner && typeof movedOwner.token === 'string' ? movedOwner.token : '';
-
-      // Only delete if we moved the same stale lock we inspected (token match).
-      if (movedToken !== rememberedToken) {
-        let restored = false;
-        let restoreErr = null;
+      // Serialize reclaimers. Without this, a challenger that inspected the old
+      // stale lock could rename away a *fresh* lock another process had just
+      // created, letting a third process mkdir and win as well (two owners).
+      const reclaim = await withReclaimMutex(lockDir, staleMs, fs, async () => {
+        // Re-check under the mutex: the lock may have been reclaimed meanwhile.
+        let st2;
         try {
-          await fs.stat(lockDir);
-          // Original name occupied — leave the moved dir in place; do not delete.
+          st2 = await fs.stat(lockDir);
         } catch (se) {
-          if (se && se.code === 'ENOENT') {
-            try {
-              await fs.rename(staleName, lockDir);
-              restored = true;
-            } catch (re2) {
-              restoreErr = re2;
-            }
-          } else {
-            restoreErr = se;
-          }
+          if (se && se.code === 'ENOENT') return 'retry';
+          throw se;
         }
-        if (restored) {
-          throw new LedgerLockedError('stale rename raced; restored foreign lock');
-        }
-        if (restoreErr) {
-          throw new LedgerLockedError(
-            `stale rename raced; restore failed: ${restoreErr.message || restoreErr}`,
-          );
-        }
-        throw new LedgerLockedError('stale rename raced; left moved lock in place');
-      }
+        const owner2 = await readOwner(lockDir, fs);
+        const token2 = owner2 && typeof owner2.token === 'string' ? owner2.token : '';
+        const age2 = Date.now() - st2.mtimeMs;
+        const dead2 = owner2 ? pidDefinitelyDead(owner2.pid) : true;
+        const reclaimable2 = (dead2 && age2 > esrchGrace) || (!dead2 && age2 > liveStaleAfter);
+        if (!reclaimable2 || token2 !== rememberedToken) return 'held';
 
-      let movedStat = null;
-      try {
-        movedStat = await fs.stat(staleName);
-      } catch {
-        movedStat = null;
-      }
-      const movedAge = movedStat ? Date.now() - movedStat.mtimeMs : Infinity;
-      const movedDead = movedOwner ? pidDefinitelyDead(movedOwner.pid) : true;
-      const stillReclaimable =
-        (movedDead && movedAge > esrchGrace) || (!movedDead && movedAge > liveStaleAfter);
-
-      if (!stillReclaimable) {
-        let lockExists = true;
+        const staleName = `${lockDir}.stale-${token}`;
         try {
-          await fs.stat(lockDir);
-        } catch (se) {
-          if (se && se.code === 'ENOENT') lockExists = false;
-          else throw se;
+          await fs.rename(lockDir, staleName);
+        } catch (re) {
+          if (re && re.code === 'ENOENT') return 'retry';
+          throw re;
         }
-        if (!lockExists) {
+
+        const movedOwner = await readOwner(staleName, fs);
+        const movedToken = movedOwner && typeof movedOwner.token === 'string' ? movedOwner.token : '';
+
+        // Only delete if we moved the same stale lock we inspected (token match).
+        if (movedToken !== rememberedToken) {
+          let restored = false;
+          let restoreErr = null;
           try {
-            await fs.rename(staleName, lockDir);
-          } catch (re2) {
+            await fs.stat(lockDir);
+            // Original name occupied — leave the moved dir in place; do not delete.
+          } catch (se) {
+            if (se && se.code === 'ENOENT') {
+              try {
+                await fs.rename(staleName, lockDir);
+                restored = true;
+              } catch (re2) {
+                restoreErr = re2;
+              }
+            } else {
+              restoreErr = se;
+            }
+          }
+          if (restored) {
+            throw new LedgerLockedError('stale rename raced; restored foreign lock');
+          }
+          if (restoreErr) {
             throw new LedgerLockedError(
-              `stale criteria failed; restore failed: ${re2.message || re2}`,
+              `stale rename raced; restore failed: ${restoreErr.message || restoreErr}`,
             );
           }
+          throw new LedgerLockedError('stale rename raced; left moved lock in place');
         }
-        throw new LedgerLockedError();
-      }
 
-      try {
-        await fs.rm(staleName, { recursive: true, force: true });
-      } catch {
-        /* ignore */
-      }
-      // Loop and mkdir.
+        let movedStat = null;
+        try {
+          movedStat = await fs.stat(staleName);
+        } catch {
+          movedStat = null;
+        }
+        const movedAge = movedStat ? Date.now() - movedStat.mtimeMs : Infinity;
+        const movedDead = movedOwner ? pidDefinitelyDead(movedOwner.pid) : true;
+        const stillReclaimable =
+          (movedDead && movedAge > esrchGrace) || (!movedDead && movedAge > liveStaleAfter);
+
+        if (!stillReclaimable) {
+          let lockExists = true;
+          try {
+            await fs.stat(lockDir);
+          } catch (se) {
+            if (se && se.code === 'ENOENT') lockExists = false;
+            else throw se;
+          }
+          if (!lockExists) {
+            try {
+              await fs.rename(staleName, lockDir);
+            } catch (re2) {
+              throw new LedgerLockedError(
+                `stale criteria failed; restore failed: ${re2.message || re2}`,
+              );
+            }
+          }
+          throw new LedgerLockedError();
+        }
+
+        try {
+          await fs.rm(staleName, { recursive: true, force: true });
+        } catch {
+          /* ignore */
+        }
+        return 'retry';
+      });
+
+      if (reclaim === 'retry') continue; // Loop and mkdir.
+      // Mutex busy or lock no longer stale: behave like a held lock.
+      if (!lockTimeoutMs || lockTimeoutMs <= 0) throw new LedgerLockedError();
+      if (Date.now() - started >= lockTimeoutMs) throw new LedgerLockedError();
+      await sleep(50);
     }
   }
 }
