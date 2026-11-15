@@ -303,3 +303,24 @@ test('stale rename race: challenger must not delete winner lock', async () => {
   assert.equal(owner.pid, process.pid);
   await winner.close();
 });
+
+test('a reclaim mutex left by a crashed reclaimer does not block forever', async () => {
+  const dir = await tmp();
+  const staleMs = 200;
+  const lockDir = path.join(dir, 'ledger.lock');
+  await fs.mkdir(lockDir);
+  await fs.writeFile(
+    path.join(lockDir, 'owner.json'),
+    JSON.stringify({ pid: 1_000_000_007, token: 'dead', startedAt: new Date(0).toISOString() }),
+  );
+  const old = new Date(Date.now() - 60_000);
+  await fs.utimes(lockDir, old, old);
+  // Leftover mutex from a reclaimer that died mid-reclaim.
+  await fs.mkdir(`${lockDir}.reclaim`);
+  await fs.utimes(`${lockDir}.reclaim`, old, old);
+
+  const ledger = await Ledger.open(dir, { staleMs, lockTimeoutMs: 2000 });
+  const owner = JSON.parse(await fs.readFile(path.join(lockDir, 'owner.json'), 'utf8'));
+  assert.equal(owner.pid, process.pid);
+  await ledger.close();
+});

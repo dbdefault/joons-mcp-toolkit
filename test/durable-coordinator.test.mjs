@@ -82,11 +82,20 @@ test('durable: crash while RUNNING then open yields UNKNOWN', async () => {
     err.outcomeUnknown = true;
     throw err;
   });
-  await new Promise((r) => setTimeout(r, 40));
-  assert.equal(c.get('mid').state, 'RUNNING');
-  // simulate process loss: close without finishing
-  await ledger.close();
-  stop = true;
+  try {
+    // Wait for the RUNNING transition instead of a fixed sleep: the durable
+    // write can take longer than 40 ms on slow CI disks (Windows/macOS).
+    const deadline = Date.now() + 5000;
+    while (c.get('mid')?.state !== 'RUNNING' && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    assert.equal(c.get('mid').state, 'RUNNING');
+    // simulate process loss: close without finishing
+    await ledger.close();
+  } finally {
+    // Always release the worker loop, otherwise a failed assertion hangs the run.
+    stop = true;
+  }
   void pending.catch(() => {});
   await new Promise((r) => setTimeout(r, 40));
 
